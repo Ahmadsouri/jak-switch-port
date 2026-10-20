@@ -52,13 +52,62 @@ void write_binary_file(const fs::path& name, const void* data, size_t size);
 void write_rgba_png(const fs::path& name, void* data, int w, int h);
 void write_text_file(const std::string& file_name, const std::string& text);
 void write_text_file(const fs::path& file_name, const std::string& text);
+
+/*!
+ * Write a text file, returning false instead of throwing when it cannot be written.
+ *
+ * The settings saves run during boot, and an exception out of one of them used to escape all the
+ * way out of main() -- which rethrows, so the process died on the title screen with nothing but
+ * "Unexpected exception occurred" in the log. A save that cannot be written deserves a loud line
+ * on the SD card, not a dead process, so callers that must not abort use this. The failure is
+ * still reported: on Switch to gk_boot_log.txt, elsewhere through lg.
+ */
+bool try_write_text_file(const fs::path& file_name, const std::string& text);
 std::vector<uint8_t> read_binary_file(const std::string& filename);
 std::vector<uint8_t> read_binary_file(const fs::path& filename);
+
+/*!
+ * Block-oriented read handle for the Switch port.
+ *
+ * The engine reads files in offset-sized chunks (the ISO/overlord loader pulls one sector run at a
+ * time out of a file it keeps open), so read_binary_file()'s "read the whole thing" shape is the
+ * wrong tool there. That code used to keep a POSIX descriptor open across threads instead -- which
+ * is exactly what this port cannot do, for the reasons documented at the top of FileUtil.cpp:
+ * newlib resolves open/read/close through the global devoptab_list, and that table is torn down
+ * when any part of the process begins exiting, so a read racing a shutdown dereferences a null
+ * device entry.
+ *
+ * These calls go straight to the FS service, need no device table, and are safe from any thread.
+ * The handle is opaque so this header does not have to pull in the platform's headers.
+ */
+struct NativeFileHandle;
+NativeFileHandle* native_open_read(const std::string& path);
+// File size, or -1 if the handle is bad.
+s64 native_file_size(NativeFileHandle* handle);
+// Reads exactly `len` bytes from `offset`. false on any error or short read.
+bool native_read_at(NativeFileHandle* handle, u64 offset, void* dst, u64 len);
+void native_close(NativeFileHandle* handle);
 std::string read_text_file(const std::string& path);
 std::string read_text_file(const fs::path& path);
 bool is_printable_char(char c);
 std::string combine_path(const std::string& parent, const std::string& child);
 bool file_exists(const std::string& path);
+
+/*!
+ * Size of a file in bytes, or -1 when it cannot be determined. Never throws.
+ *
+ * The memory-card code used to guard its reads with `fs::exists(p) || fs::file_size(p) < n`, and on
+ * this port that guard is worse than useless in one specific direction: ghc::filesystem answers
+ * exists() from a stat through the global devoptab (see file_exists()), and its file_size() throws
+ * ghc::filesystem::filesystem_error when that stat fails. The first save into an empty slot is
+ * exactly that case -- the bank file does not exist yet -- and an exception out of a guest call is
+ * an uncaught exception, which ends the process in abort() with no crash report at all.
+ *
+ * Callers here want a number they can compare, so this answers -1 for "missing or unreadable" and
+ * never throws. On Switch it asks the FS service (native_open_read/native_file_size), which is the
+ * only layer with a reliable record on sdmc: for this port.
+ */
+s64 file_size(const fs::path& path);
 std::string base_name(const std::string& filename);
 std::string base_name_no_ext(const std::string& filename);
 std::string split_path_at(const fs::path& path, const std::vector<std::string>& folders);
