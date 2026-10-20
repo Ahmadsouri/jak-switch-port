@@ -9,6 +9,10 @@
 
 #include "989snd/player.h"
 
+#ifdef __SWITCH__
+#include "game/switch/boot_log.h"
+#endif
+
 std::unique_ptr<snd::Player> player;
 
 void snd_StartSoundSystem() {
@@ -222,7 +226,22 @@ snd::BankHandle snd_BankLoadEx(const char* filename,
   if (player) {
     // TODO put the load on the thread pool?
     auto file_buf = file_util::read_binary_file(std::string(filename));
-    return player->LoadBank(std::span(file_buf).subspan(offset));
+#ifdef __SWITCH__
+    // The card log otherwise stops at the successful read and says nothing about the parse that
+    // follows, which is where a bad header turns into a garbage std::span rather than an error.
+    // Trace the numbers handed to the parser so the two can be told apart.
+    {
+      char trace[192];
+      snprintf(trace, sizeof(trace), "[snd] BankLoadEx %s offset=%d size=%zu\n", filename,
+               (int)offset, file_buf.size());
+      switch_boot_log_event(trace);
+    }
+#endif
+    auto bank_handle = player->LoadBank(std::span(file_buf).subspan(offset));
+#ifdef __SWITCH__
+    switch_boot_log_event("[snd] BankLoadEx LoadBank returned\n");
+#endif
+    return bank_handle;
   } else {
     return 0;
   }

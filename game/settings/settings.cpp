@@ -61,7 +61,9 @@ void DebugSettings::save_settings() {
   auto debug_settings_filename =
       file_util::get_user_misc_dir(g_game_version) / "debug-settings.json";
   file_util::create_dir_if_needed_for_file(debug_settings_filename);
-  file_util::write_text_file(debug_settings_filename, data.dump(2));
+  // try_write_text_file, not write_text_file: this runs during boot and a throw here would reach
+  // main()'s rethrow and kill the process (see the note on the helper).
+  file_util::try_write_text_file(debug_settings_filename, data.dump(2));
 }
 
 void to_json(json& j, const DisplaySettings& obj) {
@@ -106,7 +108,9 @@ void DisplaySettings::save_settings() {
   json data = *this;
   auto file_path = file_util::get_user_settings_dir(g_game_version) / "display-settings.json";
   file_util::create_dir_if_needed_for_file(file_path);
-  file_util::write_text_file(file_path, data.dump(2));
+  // This is the exact write that used to end the process: save_settings() is called unguarded from
+  // DisplayManager::init() and from its destructor, so a failure here reached main()'s rethrow.
+  file_util::try_write_text_file(file_path, data.dump(2));
 }
 
 void to_json(json& j, const InputSettings& obj) {
@@ -163,6 +167,6 @@ void InputSettings::save_settings() {
   json data = *this;
   auto file_path = file_util::get_user_settings_dir(g_game_version) / "input-settings.json";
   file_util::create_dir_if_needed_for_file(file_path);
-  file_util::write_text_file(file_path, data.dump(2));
+  file_util::try_write_text_file(file_path, data.dump(2));
 }
 }  // namespace game_settings

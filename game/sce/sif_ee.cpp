@@ -4,6 +4,7 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "common/log/log.h"
 #include "common/util/Assert.h"
 #include "common/util/FileUtil.h"
 
@@ -119,12 +120,21 @@ s32 sceOpen(const char* filename, s32 flag) {
     } break;
   }
   if (!fp) {
-    printf("[SCE] sceOpen(%s) failed.\n", name.c_str());
+    // lg::, not printf: on this port stdout is redirected to sdmc:/gk_stdout.txt, which has stayed a
+    // 0-byte file on every run, so a failure reported there is a failure nobody ever reads. The
+    // guest cannot see this either -- kopen stores the -1 and the caller then writes to it -- which
+    // is how a failed settings write turns into the assert in sceWrite below.
+    lg::error("[SCE] sceOpen(\"{}\") failed (flag {:#x})", name, (u32)flag);
     return -1;
   }
 
-  s32 fp_idx = sce_fds.size() + 1;
+  // A counter, not sce_fds.size() + 1: closing a stream leaves the table smaller again, so the size
+  // hands out an fd that is still in use and two open files then share one entry -- silently
+  // writing one file's bytes into another.
+  static s32 s_next_sce_fd = 1;
+  const s32 fp_idx = s_next_sce_fd++;
   sce_fds[fp_idx] = fp;
+  lg::debug("[SCE] sceOpen(\"{}\") -> fd {}", name, fp_idx);
   return fp_idx;
 }
 
@@ -161,7 +171,11 @@ s32 sceRead(s32 fd, void* buf, s32 nbyte) {
 s32 sceWrite(s32 fd, const void* buf, s32 nbyte) {
   auto kv = sce_fds.find(fd);
   if (kv == sce_fds.end()) {
-    ASSERT(false);
+    // Deliberately not an ASSERT. It fires whenever a write follows a failed open -- exactly what
+    // kopen() does when sceOpen() cannot create the file (it stores the -1 and the guest writes to
+    // it anyway) -- and killing the process over a settings file the player did not ask for is the
+    // wrong trade. Mirrors sceRead(), which has always reported an unknown descriptor instead.
+    lg::error("[SCE] sceWrite on unknown fd {} ({} bytes dropped)", fd, nbyte);
     return -1;
   } else {
     return fwrite(buf, 1, nbyte, kv->second);

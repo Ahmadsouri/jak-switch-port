@@ -941,7 +941,16 @@ static int stbi__stdio_eof(void *user)
    return feof((FILE*) user) || ferror((FILE *) user);
 }
 
-static stbi_io_callbacks stbi__stdio_callbacks =
+// See third-party/stb_image/stb_image.h: a never-written static would be
+// emitted into .rodata, but its R_AARCH64_RELATIVE relocations are applied by
+// the module loader into read-only memory.  Keep it in .data.
+#ifdef __aarch64__
+#define STBI_CALLBACKS_SECTION __attribute__((section(".data")))
+#else
+#define STBI_CALLBACKS_SECTION
+#endif
+
+static STBI_CALLBACKS_SECTION stbi_io_callbacks stbi__stdio_callbacks =
 {
    stbi__stdio_read,
    stbi__stdio_skip,

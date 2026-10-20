@@ -774,7 +774,18 @@ static int stbi__stdio_eof(void *user)
    return feof((FILE*) user);
 }
 
-static stbi_io_callbacks stbi__stdio_callbacks =
+// This table is only ever read, so the compiler is free to emit it into
+// .rodata.  It is a PIE image though, so each entry needs an
+// R_AARCH64_RELATIVE relocation, and the module loader applies those
+// relocations verbatim -- writing into a read-only LOAD segment aborts before
+// main() ever runs.  Pin it to .data so the relocations land in writable memory.
+#ifdef __aarch64__
+#define STBI_CALLBACKS_SECTION __attribute__((section(".data")))
+#else
+#define STBI_CALLBACKS_SECTION
+#endif
+
+static STBI_CALLBACKS_SECTION stbi_io_callbacks stbi__stdio_callbacks =
 {
    stbi__stdio_read,
    stbi__stdio_skip,
