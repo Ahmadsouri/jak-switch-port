@@ -467,6 +467,13 @@ u64 kopen(u64 fs, u64 name, u64 mode) {
     file_stream->file = sceOpen(Ptr<String>(name)->data(), SCE_TRUNC | SCE_CREAT | SCE_WRONLY);
   }
 
+  if (file_stream->file < 0) {
+    // Report in lg:: so the name survives on the card. The guest keeps the -1 and writes to it, so
+    // without this line the failure is invisible: it reaches the log only as "sceWrite on unknown
+    // fd -1", with no hint of which file was wanted.
+    lg::error("kopen(\"{}\") failed: the file could not be opened", Ptr<String>(name)->data());
+  }
+
   return fs;
 }
 

@@ -1,5 +1,8 @@
 #include "kmachine.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <random>
 
 #include "common/global_profiler/GlobalProfiler.h"
@@ -1026,6 +1029,48 @@ void pc_set_frame_rate(int rate) {
 }
 
 void pc_set_game_resolution(int w, int h) {
+#if defined(__SWITCH__)
+  // The internal render target is independent of the presented framebuffer: the final blit scales
+  // game_res up into the real window. This port was rendering at whatever the display reported --
+  // 1920x1080 when docked -- which the Switch's GL driver (Mesa over nvdrv) cannot hold at a
+  // playable rate, so boot-shaped gameplay ran ~2.25x heavier than it needs to. Cap the render
+  // target at 720p and let the blit scale it up: same output resolution, less than half the
+  // pixels. Create sdmc:/switch/jak1/native-render.txt to get the unclamped size back.
+  static const bool keep_native_render =
+      file_util::file_exists("sdmc:/switch/jak1/native-render.txt");
+  if (!keep_native_render && (w > 1280 || h > 720)) {
+    const double scale = std::min(1280.0 / (double)w, 720.0 / (double)h);
+    w = std::max(1, (int)(w * scale));
+    h = std::max(1, (int)(h * scale));
+  }
+  // Report the size that actually gets used -- and only when it changes, so it doesn't spam per
+  // frame.
+  //
+  // Through lg, not stdout, and that is not cosmetic: fmt::print() *throws* fmt::system_error when
+  // the underlying fwrite writes fewer bytes than asked (fmt's fwrite_all), and this function is
+  // called from GOAL guest code on the EE thread -- nothing between here and the thread entry
+  // catches. A single failed stdout write therefore became std::terminate -> abort ->
+  // __libnx_exit -> __appExit, whose teardown clears libnx's devices while the other threads are
+  // still logging; the crash the console reported was the Data Abort that collateral damage caused
+  // (offset 0x20 in _write_r) and this line was its real cause. The game log is this thread's
+  // channel with a proven record (see FileUtil.h).
+  {
+    static int last_w = -1, last_h = -1;
+    if (w != last_w || h != last_h) {
+      last_w = w;
+      last_h = h;
+      lg::debug("[SWITCH-RES] render target {}x{}", w, h);
+      // ...and keep the stdout redirect honest, without ever throwing: fprintf returns the error
+      // instead. stdout points at sdmc:/gk_stdout.txt (main.cpp), its writes stopped landing after
+      // early boot, and this is the first write after that -- so report the reason once, where the
+      // log can see it (errno text for fmt's system_error is all we would otherwise get).
+      if (fprintf(stdout, "[SWITCH-RES] render target %dx%d\n", w, h) < 0) {
+        lg::error("[SWITCH-RES] stdout write failed: errno={} ({}) fileno={}", errno,
+                  std::strerror(errno), fileno(stdout));
+      }
+    }
+  }
+#endif
   Gfx::g_global_settings.game_res_w = w;
   Gfx::g_global_settings.game_res_h = h;
 }

@@ -8,20 +8,62 @@
 
 #include "kmemcard.h"
 
+#include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#include <vector>
 
+#include "common/log/log.h"
 #include "common/util/Assert.h"
 #include "common/util/FileUtil.h"
 #include "common/util/Timer.h"
 
+#if defined(__SWITCH__)
+#include "game/switch/boot_log.h"
+#include "game/switch/stdout_sink.h"
+#endif
+
+#include "common/goal_constants.h"
+
+#include "game/runtime.h"
 #include "game/sce/sif_ee.h"
 #include "game/sce/sif_ee_memcard.h"
 
 #include "fmt/format.h"
 
+#if defined(__SWITCH__)
+// Left on for this port: the console has no debugger attached and the memory-card state machine
+// is entirely silent otherwise, so a failed save shows up only as the game's own error dialog with
+// no clue which step failed. Every mc_print line lands in sdmc:/gk_stdout.txt *and* in
+// sdmc:/gk_boot_log.txt (see mc_print below) -- stdout stops being useful very early on this port,
+// so the card trace is the one to read.
+static constexpr bool memcard_debug = true;
+#else
 static constexpr bool memcard_debug = false;
+#endif
+
+/*!
+ * Trace one memory-card step to the SD card, unconditionally and immediately.
+ *
+ * This is the diagnostics for the save/load state machine, and it exists because the interesting
+ * failures here do not leave a crash report behind at all: an exception escaping a guest call, or
+ * a libnx diag abort, ends the process in abort() with an on-screen error code and nothing on the
+ * card. A step-by-step trace that is already flushed before the next step starts is what turns
+ * "the console dies when the save menu is opened" into "it dies after update_card read bank2".
+ *
+ * It is deliberately *not* routed through mc_print (which goes to stdout), and not through lg::
+ * either: switch_boot_log_event writes through the same stdio sink as the boot trace, under the FS
+ * lock, and ignores the boot-only gate.
+ */
+#if defined(__SWITCH__)
+#define MC_TRACE(...) switch_boot_log_event(fmt::format(__VA_ARGS__).c_str())
+#else
+#define MC_TRACE(...) ((void)0)
+#endif
 
 using McCallbackFunc = void (*)(s32);
 
@@ -57,13 +99,31 @@ using namespace ee;
 
 template <typename... Args>
 void mc_print(const std::string& str, Args&&... args) {
-  if (memcard_debug) {
-    fmt::print("[MC] ");
+  if (!memcard_debug) {
+    return;
+  }
+  {
+#if defined(__SWITCH__)
+    std::string line = fmt::format(fmt::runtime(str), std::forward<Args>(args)...);
+    // The card trace is the one that survives a crash (see MC_TRACE).
+    switch_boot_log_event(("[MC] " + line + '\n').c_str());
+    // ...and the game log, through lg, *not* fmt::print: fmt::print to this port's stdout threw
+    // fmt::system_error ("cannot write to file: I/O error") the moment its write stopped landing,
+    // and this call site is the save path -- that exception was the crash. lg's stdout branch is
+    // off on Switch (see setup_logging), so lg only writes the file.
+    if (!line.empty() && line.back() == '\n') {
+      line.pop_back();
+    }
+    lg::print("[MC] {}", line);
+    // stdout is a memory stream here; keep it from growing without bound on long runs.
+    switch_stdout_trim_if_large();
+#else
     if (!str.empty() && str.back() == '\n') {
       fmt::print(fmt::runtime(str), std::forward<Args>(args)...);
     } else {
       fmt::print(fmt::runtime(str + '\n'), std::forward<Args>(args)...);
     }
+#endif
   }
 }
 
@@ -152,73 +212,216 @@ u32 mc_checksum(Ptr<u8> data, s32 size) {
 }
 
 /*!
+ * One probed save slot on the Switch's SD card.
+ *
+ * Probing the card from GOAL code turned out to be the pause-menu hang: the save menu's
+ * (respond-common) runs (mc-get-slot-info) every frame it is open, MC_get_status() served every
+ * one of those calls with a full rescan of all four slots, and each rescan was six card-opening
+ * round trips plus a 67 KB read per present bank -- the game log of the build28 run shows the
+ * whole probe cycle repeating with a ~10-line period for hundreds of consecutive frames, each
+ * frame dispatching in 130-177 ms. The card is not going to be rotated underneath us (there is no
+ * physical card to swap; saves only appear through this process's own writes), so the probe
+ * results can be cached and refreshed rarely, like the console's own card-state polling did.
+ */
+// Forward declaration: the cache code below reads 1 KB headers through this helper, whose full
+// definition lives after the state machine (it needs MC_TRACE and file_util, and this file's
+// include order has them set up by then).
+static bool pc_read_bank_header(const fs::path& path, McHeader& out);
+
+struct McSlotCacheEntry {
+  bool probed = false;             // have we ever looked at this slot?
+  bool present = false;            // bank0 exists and is full-size
+  bool aux_present = false;        // the alternate bank (bank0+1) exists and is full-size
+  u32 save_count = 0;
+  u32 last_saved_bank = 0;
+  McHeader header{};               // of the most recent of the two banks
+};
+
+struct McSlotCache {
+  McSlotCacheEntry slots[4];
+  Timer since_probe;               // time since the last full (re)probe
+  bool dirty = true;               // must refresh before the next answer is served
+};
+static McSlotCache mc_cache;
+
+// The refresh interval. Long enough that a probe cycle (roughly 0.3-0.4 s of card I/O) can never
+// happen every frame; short enough that a save written from the other side of a restart is seen
+// within a second. Saves push immediate invalidation anyway (mc_invalidate_cache), so this only
+// governs how often the menu re-reads for its own sake.
+constexpr double MC_PROBE_INTERVAL_SECONDS = 1.0;
+
+/*!
+ * Drop the cache and force the next mc-cache request to re-probe the card.
+ *
+ * Call after every save and load: those change the card's contents (new bank, bumped save count)
+ * and the state machine reads files-is-present/headers right after them, which must see the new
+ * state, not the cached one.
+ */
+static void mc_invalidate_cache() {
+  if (mc_cache.dirty) {
+    return;  // already invalidated; no need to reset the timer again
+  }
+  mc_cache.dirty = true;
+  MC_TRACE("[MC] cache invalidated\n");
+}
+
+/*!
+ * Full re-probe of the four save slots, filling the cache.
+ *
+ * This is the old per-frame work, run at most once per second (and only when somebody asks):
+ * for each slot, open bank0, size it, read its header if sized right, then the same for the
+ * alternate bank. Missing banks are "fopen failed" -- one open attempt, no read, and today's
+ * earlier rate-limited switch_log_file keeps them from flooding the card trace.
+ */
+static void mc_refresh_cache() {
+  for (int file = 0; file < 4; file++) {
+    auto& e = mc_cache.slots[file];
+    e = {};  // probed=false, everything else zeroed
+    e.probed = true;
+
+    const auto bank0_path = mc_get_filename(g_game_version, 4 + file * 2);
+    const s64 size0 = file_util::file_size(bank0_path);
+    if (size0 < (s64)mc_get_total_bank_size(g_game_version)) {
+      // bank0 missing (or short): the slot is empty, and bank1 is irrelevant.
+      MC_TRACE("[MC] probe slot {}: bank0 size={} need={}\n", file, size0,
+               mc_get_total_bank_size(g_game_version));
+      continue;
+    }
+
+    McHeader h0{};
+    if (!pc_read_bank_header(bank0_path, h0)) {
+      // The size check passed but the read failed: treat as empty, same "believe the read" rule
+      // the old pc_update_card had.
+      MC_TRACE("[MC] probe slot {}: bank0 header read failed\n", file);
+      continue;
+    }
+    e.present = true;
+    e.save_count = h0.save_count;
+    e.header = h0;
+    e.last_saved_bank = 0;
+
+    const auto bank1_path = mc_get_filename(g_game_version, 1 + 4 + file * 2);
+    const s64 size1 = file_util::file_size(bank1_path);
+    if (size1 >= (s64)mc_get_total_bank_size(g_game_version)) {
+      McHeader h1{};
+      if (pc_read_bank_header(bank1_path, h1)) {
+        e.aux_present = true;
+        if (h1.save_count > h0.save_count) {
+          // use most recent bank here.
+          e.save_count = h1.save_count;
+          e.header = h1;
+          e.last_saved_bank = 1;
+        }
+      }
+    }
+    MC_TRACE("[MC] probe slot {}: present=1 save_count={} bank={}\n", file, e.save_count,
+             e.last_saved_bank);
+  }
+  mc_cache.since_probe.start();
+  mc_cache.dirty = false;
+}
+
+/*!
+ * Is the cache good enough to answer a request right now?
+ *
+ * Anything that says "the card changed" calls mc_invalidate_cache() instead of waiting for the
+ * timer, so the timer only governs the menu's own periodic re-probe.
+ */
+static void mc_ensure_cache_fresh() {
+  if (mc_cache.dirty || !mc_cache.since_probe.getSeconds() ||
+      mc_cache.since_probe.getSeconds() >= MC_PROBE_INTERVAL_SECONDS) {
+    mc_refresh_cache();
+  }
+}
+
+/*!
  * PC port function that returns whether a given bank ID's file exists or not.
+ *
+ * Served from the cache (mc_ensure_cache_fresh), not from the card: callers are the frame-rate
+ * hot path (MC_load before a save/load, MC_run's reload check) as well as the state machine, and
+ * the old version opened at least one file on the card every call.
  */
 bool file_is_present(int id, int bank = 0) {
-  auto bankname = mc_get_filename(g_game_version, 4 + id * 2 + bank);
-  if (!fs::exists(bankname) ||
-      int(fs::file_size(bankname)) < mc_get_total_bank_size(g_game_version)) {
-    // file doesn't exist, or size is bad. we do not want to open files that will crash on read!
+  // Guest-supplied index: the save path already refuses >= 4 at its entry, but MC_run's LOAD
+  // branch lands here with whatever file_idx the guest passed to MC_load, and a -1 that got
+  // through (0xffffffff, the "most recent file" the state machine is supposed to resolve
+  // itself) used to index straight off the end -- first of the filename table, and since
+  // build29 of this cache. Treat any out-of-range slot as "not present".
+  if (id < 0 || id > 3) {
+    MC_TRACE("[MC] file_is_present: slot {} out of range, refused\n", id);
     return false;
   }
-  // avoid file check here tbh. there shouldn't be any saves with a save count of zero anyway.
-  // the file check is quite slow and ultimately not very useful.
-  return true;
-
-  /*
-  // file exists. but let's see if it's an empty one.
-  // this prevents the game from reading a bank but classifying it as corrupt data.
-  // which a file full of zeros logically is.
-  auto fp = file_util::open_file(bankname.c_str(), "rb");
-
-  // we can actually just check if the save count is over zero...
-  u32 savecount = 0;
-  fread(&savecount, sizeof(u32), 1, fp);
-  fclose(fp);
-  return savecount > 0;
-  */
+  mc_ensure_cache_fresh();
+  const auto& e = mc_cache.slots[id];
+  const bool present = bank == 0 ? e.present : e.aux_present;
+  MC_TRACE("[MC] file_is_present slot={} bank={}: {} (cached)\n", id, bank, present ? "yes" : "no");
+  return present;
 }
 
 /*!
  * PC port function to set memcard info. We don't use a memory card, instead just the raw savefiles.
+ *
+ * This is the function the save/load menu runs when it opens, to fill in the four slots and their
+ * preview icons -- the background autosave never calls it. Every failure here (a missing bank, a
+ * short bank, a read that throws) now degrades to "this slot is empty" and leaves a trace on the
+ * card instead of ending the process.
+ *
+ * Almost free now: it copies the probe cache into the mc_files table the guest reads. The actual
+ * card work happens in mc_refresh_cache(), at most once per second no matter how often this is
+ * called -- and the menu calls it every frame (progress.gc's respond-common).
  */
 void pc_update_card() {
-  // int highest_save_count = 0;
+  u32 highest_save_count = 0;
   mc_last_file = -1;
+  mc_ensure_cache_fresh();
   for (s32 file = 0; file < 4; file++) {
-    auto bankname = mc_get_filename(g_game_version, 4 + file * 2);
-    mc_files[file].present = file_is_present(file);
-    if (mc_files[file].present) {
-      auto bankdata = file_util::read_binary_file(bankname.string());
-      auto header1 = reinterpret_cast<McHeader*>(bankdata.data());
-      if (file_is_present(file, 1)) {
-        auto bankname2 = mc_get_filename(g_game_version, 1 + 4 + file * 2);
-        auto bankdata2 = file_util::read_binary_file(bankname2.string());
-        auto header2 = reinterpret_cast<McHeader*>(bankdata2.data());
+    const auto& e = mc_cache.slots[file];
+    mc_files[file].present = e.present;
+    mc_files[file].most_recent_save_count = e.save_count;
+    mc_files[file].last_saved_bank = e.last_saved_bank;
+    memcpy(mc_files[file].data, e.header.preview_data, 64);
 
-        if (header2->save_count > header1->save_count) {
-          // use most recent bank here.
-          header1 = header2;
-        }
-
-        // banks chosen and checked. copy data and set info.
-        mc_files[file].last_saved_bank = header1 == header2;
-        mc_files[file].most_recent_save_count = header1->save_count;
-
-        memcpy(mc_files[file].data, header1->preview_data, 64);
-      } else {
-        // banks chosen and checked. copy data and set info.
-        mc_files[file].last_saved_bank = 0;
-        mc_files[file].most_recent_save_count = header1->save_count;
-
-        memcpy(mc_files[file].data, header1->preview_data, 64);
-      }
-
-      // if (mc_files[file].most_recent_save_count > highest_save_count) {
-      //  mc_last_file = file;
-      //  highest_save_count = mc_files[file].most_recent_save_count;
-      // }
+    // Upstream computed last_file here and it is *not* optional: the save state machine resolves
+    // the file to save over from it -- (get-card) does (set! (-> self which) (-> self info
+    // last-file)) and bails out with (mc-status-code no-last) when it is -1. Leaving it at -1 makes
+    // every 'save-last request fail even when a save exists on the card (the card trace showed
+    // "get_status: present=1000 last_file=-1" right after a successful save), so the game reports
+    // the save as failed while the bank file sits on the card, complete and valid.
+    if (mc_files[file].present && mc_files[file].most_recent_save_count > highest_save_count) {
+      mc_last_file = file;
+      highest_save_count = mc_files[file].most_recent_save_count;
     }
+  }
+}
+
+// The Switch memory card I/O also goes through file_util, and therefore through the same
+// FS-service path as everything else -- see the long note in common/util/FileUtil.cpp. It must
+// not use the POSIX open/read/write/close layer: newlib routes those through devoptab_list,
+// which is torn down when any part of the process starts exiting, so a save or a load racing an
+// exit dies on a null device entry. file_util's helpers read/write the whole file in one call,
+// which is what both callers here want anyway (a bank is written or read wholesale).
+static bool mc_write_whole_file(const fs::path& path, const void* data, size_t len) {
+  try {
+    file_util::write_binary_file(path, data, len);
+    return true;
+  } catch (const std::exception& e) {
+    fmt::print("[MC] write {} failed: {}\n", path.string(), e.what());
+    return false;
+  }
+}
+
+static bool mc_read_whole_file(const fs::path& path, void* data, size_t len) {
+  try {
+    const auto contents = file_util::read_binary_file(path);
+    if (contents.size() < len) {
+      fmt::print("[MC] read {} short: {} of {} bytes\n", path.string(), contents.size(), len);
+      return false;
+    }
+    memcpy(data, contents.data(), len);
+    return true;
+  } catch (const std::exception& e) {
+    fmt::print("[MC] read {} failed: {}\n", path.string(), e.what());
+    return false;
   }
 }
 
@@ -228,6 +431,20 @@ void pc_update_card() {
 void pc_game_save_synch() {
   Timer mc_timer;
   mc_timer.start();
+  MC_TRACE("[MC] save_synch: enter slot={}\n", op.param2);
+
+  // The file index comes from the guest. The menu passes 0..3, but the game also uses -1 to mean
+  // "the most recent file" (see the save state machine: it resolves that to (-> info last-file)
+  // before it ever reaches mc-save), and a -1 that got through would arrive here as 0xffffffff.
+  // It indexes both mc_files[] and the bank filename table, so refuse it the way a real card would
+  // -- report the error and clear the op -- rather than walking off the end of the host heap.
+  if (op.param2 >= 4) {
+    MC_TRACE("[MC] save_synch: bad file index {}, refused", op.param2);
+    op.operation = MemoryCardOperationKind::NO_OP;
+    op.result = McStatusCode::NO_FILE;
+    return;
+  }
+
   pc_update_card();
   auto path = mc_get_filename(g_game_version, 0);
   file_util::create_dir_if_needed_for_file(path.string());
@@ -253,82 +470,111 @@ void pc_game_save_synch() {
   mc_print("open {} for saving", mc_get_filename_no_dir(g_game_version, op.param2 * 2 + 4 + p4));
   auto save_path = mc_get_filename(g_game_version, op.param2 * 2 + 4 + p4);
   file_util::create_dir_if_needed_for_file(save_path.string());
-  auto fd = file_util::open_file(save_path.string().c_str(), "wb");
-  mc_print("synchronous save file open took {:.2f}ms\n", mc_timer.getMs());
-  if (fd) {
-    // cb_openedsave //
-    mc_print("save file opened, writing header...");
-    memset(&header, 0, sizeof(McHeader));
-    header.save_count = p2;
-    header.checksum = mc_checksum(op.data_ptr, BANK_SIZE[g_game_version]);
-    header.magic = MEM_CARD_MAGIC;
-    header.save_count2 = p2;
-    memcpy(header.preview_data, op.data_ptr2.c(), 64);
-    if (fwrite(&header, sizeof(McHeader), 1, fd) == 1) {
-      // cb_savedheader //
-      mc_print("save file writing main data");
-      if (fwrite(op.data_ptr.c(), BANK_SIZE[g_game_version], 1, fd) == 1) {
-        // cb_saveddata //
-        mc_print("save file writing footer");
-        if (fwrite(&header, sizeof(McHeader), 1, fd) == 1) {
-          // cb_savedfooter //
-          if (fclose(fd) == 0) {
-            // cb_closedsave //
-            mc_print("All done with saving!!");
-            op.operation = MemoryCardOperationKind::NO_OP;
-            op.result = McStatusCode::OK;
-            mc_files[op.param2].present = 1;
-            mc_files[op.param2].most_recent_save_count = p2;
-            mc_files[op.param2].last_saved_bank = p4;
-            memcpy(mc_files[op.param2].data, op.data_ptr2.c(), 64);
-            mc_last_file = op.param2;
-          } else {
-            op.operation = MemoryCardOperationKind::NO_OP;
-            op.result = McStatusCode::INTERNAL_ERROR;
-          }
-        } else {
-          fclose(fd);
-          op.operation = MemoryCardOperationKind::NO_OP;
-          op.result = McStatusCode::INTERNAL_ERROR;
-        }
-      } else {
-        fclose(fd);
-        op.operation = MemoryCardOperationKind::NO_OP;
-        op.result = McStatusCode::INTERNAL_ERROR;
-      }
-    } else {
-      fclose(fd);
-      op.operation = MemoryCardOperationKind::NO_OP;
-      op.result = McStatusCode::INTERNAL_ERROR;
-    }
+
+  // cb_openedsave //
+  mc_print("save file opened, writing header...");
+  memset(&header, 0, sizeof(McHeader));
+  header.save_count = p2;
+  header.checksum = mc_checksum(op.data_ptr, BANK_SIZE[g_game_version]);
+  header.magic = MEM_CARD_MAGIC;
+  header.save_count2 = p2;
+  memcpy(header.preview_data, op.data_ptr2.c(), 64);
+
+  // TEMP SAVE-PATH DIAGNOSTIC (build27) -- removed in build29.
+  //
+  // It ran on every save and dumped 96+ bytes through MC_TRACE. The save itself was proven good
+  // (every build28 run wrote a complete, checksummed bank that loaded back -- and the build26
+  // crash it was hunting turned out to be the stdout I/O path, not the save data), so there is
+  // nothing left it was chasing. The menu-crash-on-first-present-slot it was built for is now
+  // covered by the cache (this file's top note) by keeping the preview-copy loop short.
+
+  // Assemble the whole bank in ordinary heap memory and hand it to file_util in one call.
+  //
+  // The bank itself lives in emulated EE main memory (the jitCreate() block on this port), and
+  // the file used to be built up through raw write() calls. Both are gone now: the copy below
+  // keeps EE pages out of the I/O path, and file_util is the single place that knows how to
+  // reach the card safely (see its comment -- the POSIX layer underneath is not usable here
+  // because newlib resolves it through devoptab_list, which dies with any process exit).
+  const size_t bank_size = BANK_SIZE[g_game_version];
+  std::vector<u8> image(sizeof(McHeader) + bank_size + sizeof(McHeader));
+  memcpy(image.data(), &header, sizeof(McHeader));
+  memcpy(image.data() + sizeof(McHeader), op.data_ptr.c(), bank_size);
+  memcpy(image.data() + sizeof(McHeader) + bank_size, &header, sizeof(McHeader));
+
+  // cb_saveddata + cb_savedfooter //
+  mc_print("save file writing main data ({} bytes)", image.size());
+  MC_TRACE("[MC] save_synch: writing {} bytes to {}\n", image.size(), save_path.string());
+  if (mc_write_whole_file(save_path, image.data(), image.size())) {
+    MC_TRACE("[MC] save_synch: wrote ok\n");
+    // cb_closedsave //
+    mc_print("All done with saving!!");
+    op.operation = MemoryCardOperationKind::NO_OP;
+    op.result = McStatusCode::OK;
+    mc_files[op.param2].present = 1;
+    mc_files[op.param2].most_recent_save_count = p2;
+    mc_files[op.param2].last_saved_bank = p4;
+    memcpy(mc_files[op.param2].data, op.data_ptr2.c(), 64);
+    mc_last_file = op.param2;
+    // The card's contents just changed (new bank on disk, new save count). The in-memory mc_files
+    // update above covers the immediate consumers, and the cache is invalidated so the next probe
+    // (whether from the 1 s timer or an explicit request) re-reads the card instead of serving the
+    // pre-save picture.
+    mc_invalidate_cache();
+    fmt::print("[MC] save wrote {} bytes to {}\n", image.size(), save_path.string());
   } else {
-    fmt::print("[MC] Error opening file, errno - {}", errno);
+    fmt::print("[MC] save FAILED writing {} bytes to {}\n", image.size(), save_path.string());
     op.operation = MemoryCardOperationKind::NO_OP;
     op.result = McStatusCode::INTERNAL_ERROR;
+    mc_invalidate_cache();
   }
 
   mc_print("[MC] synchronous save took {:.2f}ms\n", mc_timer.getMs());
 }
 
-void pc_game_load_open_file(FILE* fd) {
-  if (fd) {
+/*!
+ * Read one bank out of a save file into emulated EE memory.
+ *
+ * Takes the path of the bank to read rather than an open descriptor: the whole file is pulled in
+ * by file_util (the only layer allowed to touch the card), so there is nothing to keep open
+ * across the asynchronous steps in the middle of this function -- which is also why this is now
+ * re-entrant per bank without leaking a descriptor on every path that used to call close().
+ *
+ * @param bank_path     file to read (one bank of the save)
+ * @param required_size bytes that must be present, or the read is rejected
+ * @returns true if the bank was read and copied into EE memory
+ */
+static bool pc_game_load_one_bank(const fs::path& bank_path, size_t required_size) {
+  // cb_openedload //
+  mc_print("reading save file {}...", bank_path.string());
+  // Mirror of the save path: pull the file into ordinary heap memory first and copy it into
+  // emulated EE memory afterwards, rather than asking the fs service to write straight into the
+  // jitCreate() block (which is what made saving fail).
+  std::vector<u8> staging(required_size);
+  if (mc_read_whole_file(bank_path, staging.data(), required_size)) {
+    memcpy(op.data_ptr.c() + p2 * required_size, staging.data(), required_size);
+    // cb_readload + cb_closedload //
+    return true;
+  }
+  return false;
+}
+
+void pc_game_load_open_file(bool opened) {
+  if (opened) {
     // cb_openedload //
     size_t read_size = mc_get_total_bank_size(g_game_version);
-    mc_print("reading save file...");
-    if (fread(op.data_ptr.c() + p2 * read_size, read_size, 1, fd) == 1) {
-      // cb_readload //
-      mc_print("closing save file..");
-      if (fclose(fd) == 0) {
-        // cb_closedload //
-        // added : check if aux bank exists
-        if (p2 < 1 && fs::exists(mc_get_filename(g_game_version, op.param2 * 2 + 4 + p2 + 1))) {
-          p2++;
-          mc_print("reading next save bank {}",
-                   mc_get_filename_no_dir(g_game_version, op.param2 * 2 + 4 + p2));
-          auto new_bankname = mc_get_filename(g_game_version, op.param2 * 2 + 4 + p2);
-          auto new_fd = file_util::open_file(new_bankname.string().c_str(), "rb");
-          pc_game_load_open_file(new_fd);
-        } else {
+    auto bank_path = mc_get_filename(g_game_version, op.param2 * 2 + 4 + p2);
+    if (pc_game_load_one_bank(bank_path, read_size)) {
+      // cb_closedload //
+      // added : check if aux bank exists
+      // file_util::file_exists, not fs::exists: see file_is_present -- ghc::filesystem answers
+      // exists() from an sdmc: stat through the global devoptab and gets it wrong.
+      if (p2 < 1 && file_util::file_exists(
+                       mc_get_filename(g_game_version, op.param2 * 2 + 4 + p2 + 1).string())) {
+        p2++;
+        mc_print("reading next save bank {}",
+                 mc_get_filename_no_dir(g_game_version, op.param2 * 2 + 4 + p2));
+        pc_game_load_open_file(true);
+      } else {
           // let's verify the data.
           McHeader* headers[2];
           McHeader* footers[2];
@@ -387,10 +633,12 @@ void pc_game_load_open_file(FILE* fd) {
               op.operation = MemoryCardOperationKind::NO_OP;
               op.result = McStatusCode::NEW_GAME;
               mc_last_file = op.param2;
+              mc_invalidate_cache();
             } else {
               mc_print("corrupted data");
               op.operation = MemoryCardOperationKind::NO_OP;
               op.result = McStatusCode::READ_ERROR;
+              mc_invalidate_cache();
             }
           } else {
             // pick the bank
@@ -416,14 +664,10 @@ void pc_game_load_open_file(FILE* fd) {
             op.operation = MemoryCardOperationKind::NO_OP;
             op.result = McStatusCode::OK;
             mc_print("load succeeded");
-          }
+            mc_invalidate_cache();
         }
-      } else {
-        op.operation = MemoryCardOperationKind::NO_OP;
-        op.result = McStatusCode::INTERNAL_ERROR;
       }
     } else {
-      fclose(fd);
       op.operation = MemoryCardOperationKind::NO_OP;
       op.result = McStatusCode::INTERNAL_ERROR;
     }
@@ -439,6 +683,15 @@ void pc_game_load_open_file(FILE* fd) {
 void pc_game_load_synch() {
   Timer mc_timer;
   mc_timer.start();
+  // Same guest-supplied-index guard as the save path (pc_game_save_synch): op.param2 arrives
+  // straight from the guest, and a -1/0xffffffff that escaped the state machine's own resolution
+  // would index both the filename table and the databank layout off their ends.
+  if (op.param2 >= 4) {
+    MC_TRACE("[MC] load_synch: bad file index {}, refused\n", op.param2);
+    op.operation = MemoryCardOperationKind::NO_OP;
+    op.result = McStatusCode::NO_FILE;
+    return;
+  }
   pc_update_card();
 
   // cb_reprobe_load //
@@ -446,8 +699,10 @@ void pc_game_load_synch() {
   mc_print("opening save file {}", mc_get_filename_no_dir(g_game_version, op.param2 * 2 + 4));
 
   auto path = mc_get_filename(g_game_version, op.param2 * 2 + 4);
-  auto fd = file_util::open_file(path.string().c_str(), "rb");
-  pc_game_load_open_file(fd);
+  // A save file that is not there (or is still the truncated 1024-byte one an earlier build
+  // wrote) is reported rather than opened -- there is nothing to open a descriptor for.
+  MC_TRACE("[MC] load_synch: file {} exists={}\n", path.string(), file_util::file_exists(path.string()));
+  pc_game_load_open_file(file_util::file_exists(path.string()));
 
   mc_print("synchronous load took {:.2f}ms\n", mc_timer.getMs());
 }
@@ -504,6 +759,7 @@ void MC_run() {
   } else if (op.operation == MemoryCardOperationKind::SAVE) {
     // write game save.
     // there's no cards, keep in mind.
+    MC_TRACE("[MC] run: SAVE slot={} retry={}\n", op.param2, op.retry_count);
     pc_game_save_synch();
     // allow some number of errors.
     op.retry_count--;
@@ -514,6 +770,7 @@ void MC_run() {
   } else if (op.operation == MemoryCardOperationKind::LOAD) {
     // load game save.
     // potato.
+    MC_TRACE("[MC] run: LOAD slot={} retry={}\n", op.param2, op.retry_count);
     if (!file_is_present(op.param2)) {
       // tried to load, but there's no save data in the file.
       op.operation = MemoryCardOperationKind::NO_OP;
@@ -713,4 +970,54 @@ void MC_get_status(s32 /*slot*/, Ptr<mc_slot_info> info) {
     }
   }
   info->last_file = mc_last_file;
+  MC_TRACE("[MC] get_status: present={}{}{}{} last_file={} mem_actual={}\n",
+           info->files[0].present, info->files[1].present, info->files[2].present,
+           info->files[3].present, info->last_file, info->mem_actual);
+}
+
+/*!
+ * Read one bank's 1 KB header, or false if the file is missing, unreadable, or too short.
+ *
+ * Defined here, after its first use in mc_refresh_cache() (which needs the declaration above the
+ * cache code, and this file's macros are already all set up by then).
+ *
+ * Never throws, and that is the point: this runs inside a guest call, and an exception escaping a
+ * guest call ends the process in abort() with no crash report.
+ *
+ * Gets whole-file reads for granted in the first years of the port: the probe used to pull the
+ * entire 67 KB bank to look at 1 KB of header. native_read_at with a 1 KB buffer buys that back,
+ * and it does not stage the file through a heap vector the way read_binary_file did.
+ */
+static bool pc_read_bank_header(const fs::path& path, McHeader& out) {
+  auto* handle = file_util::native_open_read(path.string());
+  if (!handle) {
+    // Missing: one open attempt, and today's FileUtil rate-limits the log line.
+    return false;
+  }
+  const s64 file_len = file_util::native_file_size(handle);
+  if (file_len < (s64)sizeof(McHeader)) {
+    file_util::native_close(handle);
+    MC_TRACE("[MC] read header {} short: {} bytes\n", path.string(), file_len);
+    return false;
+  }
+  // The staging buffer must live on the HEAP, not this thread's C++ stack.
+  //
+  // On this port the guest call runs on the EE thread whose stack is inside the emulated EE main
+  // memory block (the jitCreate() region), and the FS service refuses transfer buffers from that
+  // region -- the exact failure switch_read_whole_file() already documented for the 64 KB stack
+  // staging buffer it once used ("buffer is not usable for fs library", 0xD401) and fixed by
+  // staging through a heap vector. The evidence for it being the same here: every probe cycle in
+  // the build29 card log failed at the (read) step, 77/77, while the identical-size bank write
+  // from a heap std::vector succeeded every time, and the one cycle whose fs-service open was
+  // refused (0xd401) and therefore fell back to stdio/fread is the only probe that ever read a
+  // header successfully -- fread through newlib does not hand the raw address to the kernel.
+  const std::vector<u8> buffer(sizeof(McHeader));
+  const bool ok = file_util::native_read_at(handle, 0, const_cast<u8*>(buffer.data()), sizeof(McHeader));
+  file_util::native_close(handle);
+  if (!ok) {
+    MC_TRACE("[MC] read header {} failed (read)\n", path.string());
+    return false;
+  }
+  memcpy(&out, buffer.data(), sizeof(McHeader));
+  return true;
 }
