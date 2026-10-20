@@ -383,3 +383,36 @@ target_link_libraries(gk runtime)
 if(WIN32)
     set_target_properties(gk PROPERTIES VS_DPI_AWARE "PerMonitor")
 endif()
+if(NINTENDO_SWITCH)
+    # gk.nro aborted on real hardware inside libnx's __nx_dynamic() (the NRO relocation walker)
+    # with a Data Abort on *store*. Atmosphere crash report:
+    #   PC gk+0xad7738  __nx_dynamic+0x168  -> str x1, [x2, x4]
+    #   faulting target gk+0xD2AA08 = stbi__stdio_callbacks, the very first .rela.dyn entry,
+    #   which lands in .rodata -- a segment libnx maps read-only. (An earlier theory blamed RELR
+    #   decoding; turning packing off changed nothing, so RELA is kept only because it is explicit
+    #   and easy to audit. The real fix is keeping the relocated object out of read-only memory.)
+    target_link_options(gk PRIVATE "-Wl,-z,nopack-relative-relocs")
+
+    # ...and refuse to link a module that would abort anyway.
+    set(READELF_EXE "${DEVKITPRO}/devkitA64/bin/aarch64-none-elf-readelf.exe")
+    if(NOT EXISTS "${READELF_EXE}")
+        set(READELF_EXE "$ENV{DEVKITPRO}/devkitA64/bin/aarch64-none-elf-readelf.exe")
+    endif()
+    add_custom_command(TARGET gk POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DREADELF=${READELF_EXE}
+                -DELF=$<TARGET_FILE:gk>
+                -P "${CMAKE_SOURCE_DIR}/cmake/check_readonly_relocs.cmake"
+        COMMENT "Checking gk for relocations into read-only segments")
+
+    # The second fault was the mirror image: libco's context-switch trampoline
+    # (co_swap_function) sat in a `.text#` orphan section, which ld groups into
+    # the read-only LOAD segment next to .rodata, so the first co_switch branched
+    # into non-executable memory.  Crashed PC was gk+0xD344D0 == co_swap_function.
+    add_custom_command(TARGET gk POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+                -DREADELF=${READELF_EXE}
+                -DELF=$<TARGET_FILE:gk>
+                -P "${CMAKE_SOURCE_DIR}/cmake/check_exec_sections.cmake"
+        COMMENT "Checking gk for code sections outside executable segments")
+endif()
