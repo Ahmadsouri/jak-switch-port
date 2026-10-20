@@ -29,8 +29,11 @@
 #include <unistd.h>
 #include "game/switch/boot_log.h"
 
+// Ungated: these fire a handful of times per DGO/level load, and a load that dies part-way
+// through is exactly the case worth seeing in the log -- the per-frame style gating used
+// elsewhere would silence the whole trail the moment boot tracing is switched off.
 static void boot_log_iso(const char* msg) {
-  switch_boot_log(msg);
+  switch_boot_log_event(msg);
 }
 #endif
 #include "game/runtime.h"

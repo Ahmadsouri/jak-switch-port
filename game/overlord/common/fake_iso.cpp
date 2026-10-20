@@ -11,7 +11,11 @@
 
 #include "fake_iso.h"
 
+#include <cerrno>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "common/log/log.h"
 #include "common/util/Assert.h"
@@ -130,13 +134,16 @@ const char* get_file_path(FileRecord* fr) {
 uint32_t FS_GetLength(FileRecord* fr) {
   const char* path = get_file_path(fr);
   file_util::assert_file_exists(path, "fake_iso FS_GetLength");
-  FILE* fp = file_util::open_file(path, "rb");
-  ASSERT(fp);
-  fseek(fp, 0, SEEK_END);
-  uint32_t len = ftell(fp);
-  rewind(fp);
-  fclose(fp);
-  return len;
+  // Through file_util, like every other file access on this port: neither stdio nor the POSIX
+  // descriptor layer is safe from this thread (see the note in FileUtil.h).
+  auto* handle = file_util::native_open_read(path);
+  if (!handle) {
+    lg::error("[OVERLORD] fake iso FS_GetLength could not open \"{}\"", path);
+    return 0;
+  }
+  const s64 len = file_util::native_file_size(handle);
+  file_util::native_close(handle);
+  return len > 0 ? (uint32_t)len : 0;
 }
 
 void LoadMusicTweaks() {
@@ -144,9 +151,12 @@ void LoadMusicTweaks() {
   MakeISOName(tweakname, "TWEAKVAL.MUS");
   auto file = FS_FindIN(tweakname);
   if (file) {
-    auto fp = file_util::open_file(get_file_path(file), "rb");
-    fread(&gMusicTweakInfo, sizeof(gMusicTweakInfo), 1, fp);
-    fclose(fp);
+    // Same reason as FS_GetLength above.
+    auto* handle = file_util::native_open_read(get_file_path(file));
+    if (handle) {
+      file_util::native_read_at(handle, 0, &gMusicTweakInfo, sizeof(gMusicTweakInfo));
+      file_util::native_close(handle);
+    }
   } else {
     gMusicTweakInfo.TweakCount = 0;
   }

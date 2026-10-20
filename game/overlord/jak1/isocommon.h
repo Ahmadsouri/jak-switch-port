@@ -8,6 +8,7 @@
 #include <string>
 
 #include "common/common_types.h"
+#include "common/util/FileUtil.h"
 #include "common/link_types.h"
 
 #include "game/common/overlord_common.h"
@@ -41,7 +42,11 @@ constexpr int SET_DIALOG_VOLUME = 0x406;    // Command to set the volume of vag 
 struct LoadStackEntry {
   FileRecord* fr;
   uint32_t location;  // sectors.
-  FILE* fp;
+  // Handle from file_util::native_open_read(), not a FILE* or a POSIX descriptor: the file is
+  // opened on a thread-pool thread and read from the IOP/EE side, and neither stdio nor the POSIX
+  // layer is safe here (stdio keeps per-thread state, and open/close go through newlib's global
+  // devoptab_list, which is torn down with any process exit). See the note in FileUtil.h.
+  file_util::NativeFileHandle* file = nullptr;
 };
 
 /*!

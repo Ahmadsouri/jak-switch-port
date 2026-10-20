@@ -15,8 +15,10 @@
 #include <unistd.h>
 #include "game/switch/boot_log.h"
 
+// Ungated (see iso.cpp's boot_log_iso): the level/DGO load path must stay visible after
+// boot tracing is switched off, since loads happen all through gameplay.
 static void boot_log_kdgo(const char* msg) {
-  switch_boot_log(msg);
+  switch_boot_log_event(msg);
 }
 #endif
 

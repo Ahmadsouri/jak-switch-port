@@ -1,5 +1,10 @@
 #include "fake_iso.h"
 
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "common/log/log.h"
 #include "common/util/Assert.h"
 #include "common/util/BinaryReader.h"
@@ -43,16 +48,31 @@ void fake_iso_init_globals() {
   sReadInfo = nullptr;
 }
 
-static FILE* open_fr(FileRecord* fr, s32 thread_to_wake) {
+/*!
+ * Open the FileRecord's file and hand back a raw file descriptor.
+ *
+ * Deliberately not file_util::open_file()/FILE*: this runs on a thread-pool thread while the
+ * reading side runs on the IOP/EE thread, and newlib's stdio is only correct on the thread that
+ * started the program. Handing a FILE* across those threads is what produced the Data Abort inside
+ * _lseek_r (fseek resolved a null table entry and dereferenced offset 0x30) the moment the title
+ * screen started pulling DGOs.
+ *
+ * Getting a POSIX descriptor instead fixes the thread problem but not the whole class of fault:
+ * it still resolves "sdmc:" through newlib's global devoptab_list, which is torn down once any
+ * part of the process starts exiting, and a level load racing that teardown dereferences a null
+ * device entry (Data Abort at offset 0x18). file_util::native_open_read() goes straight to the FS
+ * service instead, which is what every other file path on this port now does.
+ */
+static file_util::NativeFileHandle* open_fr(FileRecord* fr, s32 thread_to_wake) {
   const char* path = get_file_path(fr);
-  FILE* fp = file_util::open_file(path, "rb");
-  if (!fp) {
+  file_util::NativeFileHandle* file = file_util::native_open_read(path);
+  if (!file) {
     lg::error("[OVERLORD] fake iso could not open the file \"{}\"", path);
   }
 
   iop::iWakeupThread(thread_to_wake);
 
-  return fp;
+  return file;
 }
 
 /*!
@@ -76,7 +96,7 @@ LoadStackEntry* FS_Open(FileRecord* fr, int32_t offset) {
 
       auto future = thpool.submit(open_fr, fr, iop::GetThreadId());
       iop::SleepThread();
-      selected->fp = future.get();
+      selected->file = future.get();
 
       return selected;
     }
@@ -98,15 +118,14 @@ LoadStackEntry* FS_OpenWad(FileRecord* fr, int32_t offset) {
     if (!sLoadStack[i].fr) {
       selected = sLoadStack + i;
       selected->fr = fr;
-      selected->location = offset;
-
-      auto future = thpool.submit(open_fr, fr, iop::GetThreadId());
+      selected->location = offset;      auto future = thpool.submit(open_fr, fr, iop::GetThreadId());
       iop::SleepThread();
-      selected->fp = future.get();
+      selected->file = future.get();
 
       return selected;
     }
   }
+
   lg::warn("[OVERLORD] Failed to FS_OpenWad {}", fr->name);
   ExitIOP();
   return nullptr;
@@ -119,9 +138,10 @@ LoadStackEntry* FS_OpenWad(FileRecord* fr, int32_t offset) {
 void FS_Close(LoadStackEntry* fd) {
   lg::debug("[OVERLORD] FS_Close {} @ {}/{}", fd->fr->name, fd->fr->location, fd->location);
 
-  // close the FD
+  // close the file
   fd->fr = nullptr;
-  fclose(fd->fp);
+  file_util::native_close(fd->file);
+  fd->file = nullptr;
   if (fd == sReadInfo) {
     sReadInfo = nullptr;
   }
@@ -138,21 +158,17 @@ void fs_read(LoadStackEntry* fd, void* buffer, int32_t len, s32 thread_to_wake) 
   real_size = sectors * SECTOR_SIZE;
   u32 offset_into_file = SECTOR_SIZE * fd->location;
 
-  ASSERT(fd->fp);
-  fseek(fd->fp, 0, SEEK_END);
-  uint32_t file_len = ftell(fd->fp);
-  rewind(fd->fp);
+  ASSERT(fd->file != nullptr);
+  // Positional reads through the FS service -- see open_fr() above for why neither a FILE* nor a
+  // POSIX descriptor is usable from this thread.
+  const s64 file_len = file_util::native_file_size(fd->file);
 
-  if (offset_into_file < file_len) {
-    if (offset_into_file) {
-      fseek(fd->fp, offset_into_file, SEEK_SET);
+  if (file_len > 0 && offset_into_file < (u32)file_len) {
+    if ((u64)offset_into_file + real_size > (u64)file_len) {
+      real_size = (int32_t)((u64)file_len - offset_into_file);
     }
 
-    if (offset_into_file + real_size > file_len) {
-      real_size = (file_len - offset_into_file);
-    }
-
-    if (fread(buffer, real_size, 1, fd->fp) != 1) {
+    if (!file_util::native_read_at(fd->file, offset_into_file, buffer, (u64)real_size)) {
       ASSERT(false);
     }
   }

@@ -3,6 +3,7 @@
 #include <ranges>
 
 #include "common/global_profiler/GlobalProfiler.h"
+#include "common/log/log.h"
 #include "common/util/FileUtil.h"
 #include "common/util/Timer.h"
 #include "common/util/compress.h"
@@ -10,9 +11,33 @@
 #include "game/graphics/opengl_renderer/loader/LoaderStages.h"
 
 #if defined(__SWITCH__)
+#include <cstdio>
+
+#include "game/switch/boot_log.h"
 #include "game/switch/imgui_stub.h"
+
+// Ungated (see iso.cpp's boot_log_iso): a common-level reload happens on the loader thread long
+// after boot tracing is switched off, and re-reading a .fr3 file from that thread is precisely
+// where the console died on the title screen -- so the trail has to stay on. Removed from the log:
+// no other trace sites in this file.
+static void boot_log_loader(const char* msg) {
+  switch_boot_log_event(msg);
+}
+
+// The loader's own diagnostics go to the game log here, never to stdout.
+//
+// stdout on this port is an SD-card file (main.cpp redirects it), and it hangs off the same
+// devoptab entry that libnx tears down while the process is exiting: given the right timing, a
+// stdout write from this thread dereferences an entry that abort() -> _exit -> __libnx_exit ->
+// __appExit has already cleared, and dies in _write_r with a Data Abort -- one that reports this
+// print line and hides the failure that actually started the exit. The log file has a proven
+// record from this thread (see the note in FileUtil.h), so the messages go there.
+#define LOADER_PRINT(...) lg::debug(__VA_ARGS__)
 #else
+[[maybe_unused]] static void boot_log_loader(const char*) {
+}
 #include "third-party/imgui/imgui.h"
+#define LOADER_PRINT(...) fmt::print(__VA_ARGS__)
 #endif
 
 Loader::Loader(const fs::path& base_path, int max_levels)
@@ -51,7 +76,7 @@ const LevelData* Loader::get_tfrag3_level(const std::string& level_name) {
 void Loader::debug_print_loaded_levels() {
   std::unique_lock<std::mutex> lk(m_loader_mutex);
   for (const auto& [name, _] : m_loaded_tfrag3_levels) {
-    fmt::print("{}\n", name);
+    LOADER_PRINT("{}\n", name);
   }
 }
 
@@ -288,7 +313,7 @@ void Loader::loader_thread() {
         }
       }
 
-      fmt::print(
+      LOADER_PRINT(
           "------------> Load from file: {:.3f}s, import {:.3f}s, decomp {:.3f}s unpack {:.3f}s\n",
           disk_load_time, import_time, decomp_time, unpack_timer.getSeconds());
 
@@ -301,6 +326,14 @@ void Loader::loader_thread() {
       m_file_load_done_cv.notify_all();
     }
   } catch (std::exception& e) {
+    // The assert below ends in abort(), which tears the whole console down from this thread; the
+    // reason has to reach the SD card first or the run is uninformative (this is the path that
+    // killed the title screen).
+    {
+      const std::string msg =
+          fmt::format("[Loader] loader_thread: exception {} -- aborting\n", e.what());
+      boot_log_loader(msg.c_str());
+    }
     ASSERT_MSG(false, fmt::format("Exception {} encountered in loader_thread", e.what()));
   }
 }
@@ -310,7 +343,15 @@ void Loader::loader_thread() {
  * This should be called during initialization, before any threaded loading goes on.
  */
 const tfrag3::Level& Loader::load_common(TexturePool& tex_pool, const std::string& name) {
-  auto data = file_util::read_binary_file(m_base_path / fmt::format("{}.fr3", name));
+  const fs::path fr3_path = m_base_path / fmt::format("{}.fr3", name);
+#if defined(__SWITCH__)
+  {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "[Loader] load_common: reading %s\n", fr3_path.string().c_str());
+    boot_log_loader(buf);
+  }
+#endif
+  auto data = file_util::read_binary_file(fr3_path);
 
   auto decomp_data = compression::decompress_zstd(data.data(), data.size());
   Serializer ser(decomp_data.data(), decomp_data.size());
@@ -360,7 +401,7 @@ bool Loader::upload_textures(Timer& timer, LevelData& data, TexturePool& texture
 }
 
 void Loader::update_blocking(TexturePool& tex_pool) {
-  fmt::print("NOTE: coming out of blackout on next frame, doing all loads now...\n");
+  LOADER_PRINT("NOTE: coming out of blackout on next frame, doing all loads now...\n");
 
   bool missing_levels = true;
   while (missing_levels) {
@@ -397,7 +438,7 @@ void Loader::update_blocking(TexturePool& tex_pool) {
       missing_levels = false;
       for (auto& des : m_desired_levels) {
         if (m_loaded_tfrag3_levels.find(des) == m_loaded_tfrag3_levels.end()) {
-          fmt::print("blackout loader doing additional level {}...\n", des);
+          LOADER_PRINT("blackout loader doing additional level {}...\n", des);
           missing_levels = true;
         }
       }
@@ -408,10 +449,10 @@ void Loader::update_blocking(TexturePool& tex_pool) {
     }
   }
 
-  fmt::print("Blackout loads done. Current status:");
+  LOADER_PRINT("Blackout loads done. Current status:");
   std::unique_lock<std::mutex> lk(m_loader_mutex);
   for (auto& ld : m_loaded_tfrag3_levels) {
-    fmt::print("  {} is loaded.\n", ld.first);
+    LOADER_PRINT("  {} is loaded.\n", ld.first);
   }
 }
 
@@ -511,7 +552,7 @@ void Loader::update(TexturePool& texture_pool) {
         Timer stage_timer;
         done = stage->run(loader_timer, loader_input);
         if (stage_timer.getMs() > 5.f) {
-          fmt::print("stage {} took {:.2f} ms\n", stage->name(), stage_timer.getMs());
+          LOADER_PRINT("stage {} took {:.2f} ms\n", stage->name(), stage_timer.getMs());
         }
         if (!done) {
           break;
@@ -540,7 +581,7 @@ void Loader::update(TexturePool& texture_pool) {
       if (to_unload) {
         auto& lev = m_loaded_tfrag3_levels.at(*to_unload);
         std::unique_lock<std::mutex> lk(texture_pool.mutex());
-        fmt::print("------------------------- PC unloading {}\n", *to_unload);
+        LOADER_PRINT("------------------------- PC unloading {}\n", *to_unload);
         for (size_t i = 0; i < lev->level->textures.size(); i++) {
           auto& tex = lev->level->textures[i];
           if (tex.load_to_pool) {
@@ -598,7 +639,7 @@ void Loader::update(TexturePool& texture_pool) {
     }
 
     if (unload_timer.getMs() > 5.f) {
-      fmt::print("Unload took {:.2f}ms\n", unload_timer.getMs());
+      LOADER_PRINT("Unload took {:.2f}ms\n", unload_timer.getMs());
     }
 
     if (!m_garbage_buffers.empty()) {
@@ -618,7 +659,7 @@ void Loader::update(TexturePool& texture_pool) {
   }
 
   if (loader_timer.getMs() > 5) {
-    fmt::print("Loader::update slow setup: {:.1f}ms\n", loader_timer.getMs());
+    LOADER_PRINT("Loader::update slow setup: {:.1f}ms\n", loader_timer.getMs());
   }
 }
 
@@ -634,7 +675,7 @@ std::optional<MercRef> Loader::get_merc_model(const char* model_name) {
 }
 
 void Loader::unload_level_data(const std::string& name, LevelData& lev, TexturePool& tex_pool) {
-  fmt::print("force reload: unloading {}\n", name);
+  LOADER_PRINT("force reload: unloading {}\n", name);
   {
     std::unique_lock lk(tex_pool.mutex());
     for (size_t i = 0; i < lev.level->textures.size(); i++) {
@@ -697,7 +738,8 @@ void Loader::do_reload_level(const std::string& name, TexturePool& texture_pool)
 }
 
 void Loader::do_reload_common(TexturePool& tex_pool) {
-  fmt::print("loader: force reloading common level\n");
+  boot_log_loader("[Loader] do_reload_common: force reloading the common level\n");
+  LOADER_PRINT("loader: force reloading common level\n");
   {
     std::unique_lock lk(tex_pool.mutex());
     for (size_t i = 0;
@@ -726,7 +768,7 @@ void Loader::do_reload_common(TexturePool& tex_pool) {
 }
 
 void Loader::do_reload(TexturePool& texture_pool) {
-  fmt::print("loader: force reloading all levels\n");
+  LOADER_PRINT("loader: force reloading all levels\n");
   for (auto& [name, lev] : m_loaded_tfrag3_levels) {
     unload_level_data(name, *lev, texture_pool);
   }

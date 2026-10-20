@@ -35,6 +35,11 @@ using namespace ee;
 static void boot_log_km(const char* msg) {
   switch_boot_log(msg);
 }
+
+// Same file, but not latched off by switch_boot_log_finish(); used for the shutdown path.
+static void boot_log_event_km(const char* msg) {
+  switch_boot_log_event(msg);
+}
 #endif
 
 namespace jak1 {
@@ -123,9 +128,18 @@ s32 goal_main(int argc, const char* const* argv) {
   } else {
 #if defined(__SWITCH__)
     boot_log_km("[goal_main] InitMachine FAILED\n");
-#endif
+    // Do not exit() from here. exit() lands in libnx's __appExit(), which unmounts sdmc and
+    // closes the FS session, and the media/loader/audio threads are all still running at this
+    // point -- the next file read any of them does then faults inside _read_r with
+    // devoptab_list[3] == NULL (that was the first crash traced on this port). Returning
+    // instead lets exec_runtime() join its threads before the process is torn down.
+    boot_log_event_km("[goal_main] shut down cleanly instead of exit(1)\n");
+    MasterExit = RuntimeExitStatus::EXIT;
+    return 0;
+#else
     fprintf(stderr, "InitMachine failed\n");
     exit(1);
+#endif
   }
 
   return 0;

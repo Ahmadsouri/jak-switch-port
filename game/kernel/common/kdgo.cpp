@@ -19,8 +19,10 @@
 #include <unistd.h>
 #include "game/switch/boot_log.h"
 
+// Ungated (see iso.cpp's boot_log_iso): an RPC stall is a one-shot diagnostic, not per-frame
+// traffic, and it has to remain visible once boot tracing is off.
 static void boot_log_kdgo(const char* msg) {
-  switch_boot_log(msg);
+  switch_boot_log_event(msg);
 }
 #endif
 
