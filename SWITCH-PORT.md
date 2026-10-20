@@ -73,6 +73,9 @@ extractor.exe --proj-path <data> -g jak1 -c --instruction-set arm64 --disable-an
 
 `--instruction-set arm64` is mandatory; the tool defaults to x86.
 
+Step-by-step, plus the SD layout and a pre-flash check
+(`bash tools/switch/check-data.sh <data-dir>`): [GAME-DATA.md](GAME-DATA.md).
+
 ## SD card layout
 
 ```
