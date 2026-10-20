@@ -2,6 +2,18 @@
 #include "libco.h"
 #include "settings.h"
 
+/*!
+ * The context-switch trampoline MUST be executable.  The default from
+ * settings.h is a `.text#` orphan section, and the linker groups orphan `.text*`
+ * sections into the read-only LOAD segment next to .rodata (a segment whose
+ * flags lack E).  Jumping into it then traps with an Instruction Abort the
+ * first time a coroutine is entered.  Force a real .text subsection instead.
+ */
+#if !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__)) && !defined(LIBCO_NEGATIVE_TEST)
+  #undef section
+  #define section(name) __attribute__((section(".text.co_" #name)))
+#endif
+
 #include <assert.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -81,6 +93,15 @@ static void co_init() {
 static void co_entrypoint(cothread_t handle) {
   uintptr_t* buffer = (uintptr_t*)handle;
   void (*entrypoint)(void) = (void (*)(void))buffer[2];
+#if defined(__SWITCH__)
+  {
+    /* Tracing the very first coroutine switch: a fault here means the
+       trampoline section fix regressed, a silent stop means the swap
+       happened but the context came back wrong. */
+    extern void co_boot_trace(const char*);
+    co_boot_trace("[libco] co_entrypoint\n");
+  }
+#endif
   entrypoint();
   abort();  /* called only if cothread_t entrypoint returns */
 }
@@ -115,7 +136,16 @@ cothread_t co_derive(void* memory, unsigned int size, void (*entrypoint)(void)) 
 }
 
 cothread_t co_create(unsigned int size, void (*entrypoint)(void)) {
+#if defined(__SWITCH__)
+  /* Boot tracing: separates "the 3 MB stack malloc never returned" from "the
+     stack exists and the switch into it is where boot wedges". */
+  extern void co_boot_trace(const char*);
+  co_boot_trace("[libco] co_create enter\n");
+#endif
   void* memory = malloc(size);
+#if defined(__SWITCH__)
+  co_boot_trace(memory ? "[libco] co_create malloc ok\n" : "[libco] co_create malloc FAILED\n");
+#endif
   if(!memory) return (cothread_t)0;
   return co_derive(memory, size, entrypoint);
 }
@@ -125,6 +155,16 @@ void co_delete(cothread_t handle) {
 }
 
 void co_switch(cothread_t handle) {
+#if defined(__SWITCH__)
+  /* Only the very first switch is traced: it happens once, during IOP kernel
+     construction, and is the one that never came back on the last run. */
+  extern void co_boot_trace(const char*);
+  static int first_switch_traced = 0;
+  if(!first_switch_traced) {
+    first_switch_traced = 1;
+    co_boot_trace("[libco] first co_switch, about to swap\n");
+  }
+#endif
   cothread_t co_previous_handle = co_active_handle;
   co_swap(co_active_handle = handle, co_previous_handle);
 }
