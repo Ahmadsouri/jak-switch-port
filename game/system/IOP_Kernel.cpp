@@ -9,7 +9,39 @@
 
 #include "game/sce/iop.h"
 
+#if defined(__SWITCH__)
+#include "game/switch/boot_log.h"
+#define IOP_BOOT_LOG(msg) switch_boot_mark(msg)
+// Called from the C trampoline in libco's aarch64.c; declared there as plain C.
+extern "C" void co_boot_trace(const char* msg) {
+  switch_boot_log(msg);
+}
+#else
+#define IOP_BOOT_LOG(msg) ((void)0)
+#endif
+
 using namespace std::chrono;
+
+/*!
+ * Report an exception that escaped an RPC handler or an IOP thread entry.
+ *
+ * Both call sites run on libco coroutine threads, and there is no handler above them: anything
+ * thrown out of them reaches std::terminate, which aborts the whole console and (through
+ * _exit -> __libnx_exit -> __appExit) tears down libnx's devices while every other thread is still
+ * running. A file error from the guest therefore used to cost the process -- and, because the
+ * teardown can take out an unrelated thread's file write, the crash report named the wrong code.
+ * The message goes to both channels that survive (see boot_log.h) so the real reason is on the
+ * card even if the run dies later for an unrelated reason.
+ */
+static void iop_report_exception(const char* phase, const char* what) {
+#if defined(__SWITCH__)
+  const std::string msg = fmt::format("[iop] {} threw: {}\n", phase, what);
+  switch_boot_log_event(msg.c_str());
+  lg::error("[iop] {} threw: {}", phase, what);
+#else
+  lg::error("[iop] {} threw: {}", phase, what);
+#endif
+}
 
 /*
 ** wrap thread entry points to ensure they don't return into libco
@@ -17,10 +49,21 @@ using namespace std::chrono;
 static void (*thread_entry)() = nullptr;
 static cothread_t wrap_return;
 void IopThread::functionWrapper() {
+  IOP_BOOT_LOG("[iop_kernel] functionWrapper entered\n");
   void (*f)() = thread_entry;
   co_switch(wrap_return);
+  IOP_BOOT_LOG("[iop_kernel] functionWrapper resumed, calling real entry\n");
   if (f != nullptr) {
-    f();
+    // Last resort: a thread entry that throws must not take the process with it. The thread stops
+    // making progress (the loop below parks it), which is reported loudly instead of silently
+    // killing the console.
+    try {
+      f();
+    } catch (const std::exception& e) {
+      iop_report_exception("an IOP thread entry", e.what());
+    } catch (...) {
+      iop_report_exception("an IOP thread entry", "unknown exception");
+    }
   }
   // libco threads must not return
   while (true) {
@@ -29,12 +72,18 @@ void IopThread::functionWrapper() {
 }
 
 IOP_Kernel::IOP_Kernel() {
+  IOP_BOOT_LOG("[iop_kernel] ctor enter\n");
   // this ugly hack
   threads.reserve(16);
+  IOP_BOOT_LOG("[iop_kernel] threads reserved\n");
   CreateThread("null-thread", nullptr, 0);
+  IOP_BOOT_LOG("[iop_kernel] null-thread created\n");
   CreateMbx();
+  IOP_BOOT_LOG("[iop_kernel] mbx created\n");
   CreateSema(0, 0, 0, 0);
+  IOP_BOOT_LOG("[iop_kernel] sema created\n");
   kernel_thread = co_active();
+  IOP_BOOT_LOG("[iop_kernel] kernel_thread set, ctor done\n");
   m_start_time = time_point_cast<microseconds>(steady_clock::now());
 }
 
@@ -57,13 +106,17 @@ s32 IOP_Kernel::CreateThread(std::string name, void (*func)(), u32 priority) {
   ASSERT(ID == threads.size());
 
   // add entry
+  IOP_BOOT_LOG("[iop_kernel] CreateThread about to emplace (runs co_create)\n");
   threads.emplace_back(name, func, ID, priority);
+  IOP_BOOT_LOG("[iop_kernel] CreateThread emplaced entry\n");
 
   // enter the function wrapper so it can put the actual thread enry on its stack
   // to call it when the thread is eventually started
   thread_entry = func;
   wrap_return = co_active();
+  IOP_BOOT_LOG("[iop_kernel] CreateThread about to co_switch in\n");
   co_switch(threads.at(ID).thread);
+  IOP_BOOT_LOG("[iop_kernel] CreateThread returned from co_switch\n");
 
   return ID;
 }
@@ -524,9 +577,29 @@ void IOP_Kernel::rpc_loop(iop::sceSifQueueData* qd) {
       if (!cmd.started) {
         // cf
         ASSERT(func);
-        auto data = func(cmd.fno, cmd.buff, cmd.size);
+        // Nothing a handler does may kill the process. This loop is a libco coroutine thread with
+        // nothing above it that catches, so an exception out of a handler used to reach
+        // std::terminate (the title-screen crash: fake_iso's FS_GetLength -> ghc::filesystem
+        // status() on an sdmc path, which throws filesystem_error when the devoptab stat fails
+        // with anything but ENOENT). Failing is a normal outcome at this layer -- the handlers
+        // already return nullptr for "not found" -- so report it and answer the guest with an
+        // empty buffer instead of taking the console down.
+        void* data = nullptr;
+        try {
+          data = func(cmd.fno, cmd.buff, cmd.size);
+        } catch (const std::exception& e) {
+          iop_report_exception("an RPC handler", e.what());
+        } catch (...) {
+          iop_report_exception("an RPC handler", "unknown exception");
+        }
         if (cmd.copy_back_buff && cmd.copy_back_size) {
-          memcpy(cmd.copy_back_buff, data, cmd.copy_back_size);
+          // memcpy from a null answer is itself a fault; an empty buffer is the failure signal the
+          // guest reads.
+          if (data) {
+            memcpy(cmd.copy_back_buff, data, cmd.copy_back_size);
+          } else {
+            memset(cmd.copy_back_buff, 0, cmd.copy_back_size);
+          }
         }
 
         sif_mtx.lock();

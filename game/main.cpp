@@ -7,7 +7,9 @@
 
 #include <clocale>
 #include <cstdio>
+#include <exception>
 #include <string>
+
 
 #include "runtime.h"
 
@@ -26,14 +28,32 @@
 #include "third-party/CLI11.hpp"
 
 #if defined(__SWITCH__)
-#include <fcntl.h>
-#include <unistd.h>
 #include "game/switch/boot_log.h"
+#include "game/switch/stdout_sink.h"
+#endif
 
 static void boot_log_main(const char* msg) {
-  switch_boot_log(msg);
+  switch_boot_mark(msg);
 }
-#endif
+
+/*!
+ * @brief Heartbeat thread, started as the very first thing in main().
+ *
+ * Boot on this port has a hard failure mode with no crash report: if any SystemThread
+ * wedges during its init, SystemThread::start() never returns and the whole process
+ * freezes silently -- Atmosphere writes nothing, so the card only shows a log that
+ * stops mid-way. This thread is independent of every SystemThread, so it keeps
+ * reporting (stage + elapsed time) no matter which thread is stuck, which turns
+ * "froze somewhere" into "froze at stage N with the IOP thread gone / still alive".
+ */
+// NOTE: a heartbeat thread here used to live, spawned with std::thread right after the first
+// trace line. It deadlocked the boot outright: this was the *first* std::thread created in the
+// process, and on this toolchain that hangs before setlocale() has run -- the log stopped at
+// exactly that point, and stdout was never even redirected. SystemThread later creates threads
+// with std::thread from inside exec_runtime() and those work fine, so the failure is specific
+// to being the first thread this early. Do not move this back to the top of main().
+
+
 
 #ifdef _WIN32
 extern "C" {
@@ -107,23 +127,85 @@ std::string game_arg_documentation() {
  */
 int main(int argc, char** argv) {
 #if defined(__SWITCH__)
-  boot_log_main("[main] entered\n");
+  // Start each run with a fresh log, and stamp it with this build's compile time so a
+  // log that is actually from the running binary can always be identified.
+  switch_boot_log_reset();
+  boot_log_main("[main] entered -- build " __DATE__ " " __TIME__ "\n");
   // newlib resolves the locale's __mbtowc through the reent struct when formatting; on this
   // toolchain it reads back null until the locale is set explicitly, and every raw printf() in
   // the kernel/overlord layers then branches through a null pointer inside _svfiprintf_r.
   setlocale(LC_ALL, "C");
   boot_log_main("[main] locale initialized\n");
+  // Any uncaught exception, anywhere, now leaves its own message on the card before the process
+  // starts dying -- installed this early so it also covers the rest of boot.
+  //
+  // std::terminate's default is a bare abort(), and on this port that abort runs libnx's exit path
+  // (abort -> _exit -> __syscall_exit -> __libnx_exit -> __appExit), which closes service sessions
+  // and unmounts devices while every other thread is still logging. The crash report has therefore
+  // been naming whichever thread touched a FILE* next -- a Data Abort at offset 0x20 inside
+  // _write_r -- rather than the exception that caused it. That is how both real failures so far
+  // arrived: an uncaught filesystem_error out of an sdmc stat inside an IOP RPC, and an uncaught
+  // fmt::system_error from a failed stdout write inside a GOAL call on the EE thread.
+  //
+  // The message goes to the game log first (the channel with a proven record here, see FileUtil.h),
+  // then switch_fatal_report() latches switch_process_dying() so the other threads stop doing file
+  // I/O and cannot turn this into a different-looking crash.
+  std::set_terminate([]() {
+    std::string msg = "[fatal] std::terminate";
+    if (const std::exception_ptr e = std::current_exception()) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const std::exception& ex) {
+        msg += std::string(": ") + ex.what();
+      } catch (...) {
+        msg += ": (non-standard exception)";
+      }
+    } else {
+      msg += ": (no active exception)";
+    }
+    // Deposit whatever the process printed before dying -- this is the last moment file I/O is
+    // safe (switch_fatal_report() latches switch_process_dying() just below, after which every
+    // sink in the port stops touching the card on purpose).
+    switch_stdout_dump_to_card();
+    lg::error("{}", msg);
+    switch_fatal_report((msg + "\n").c_str());
+    abort();
+  });
   // Confirmed via boot-order tracing: real stdout hangs indefinitely on the first write/flush
   // issued from any thread other than main (see setup_logging()'s lg::set_stdout_level(off) for
   // the lg:: side of this). Plenty of code throughout the kernel/overlord/sce layers still calls
   // raw printf()/fprintf(stdout, ...) directly though, bypassing lg:: entirely -- redirecting the
   // actual FILE* stdout points at to a plain SD card file up front fixes all of those call sites
   // in one place instead of hunting each one down.
-  freopen("sdmc:/gk_stdout.txt", "w", stdout);
-  // Fully-buffered by default since it's a file now, and abort() (which every failed ASSERT
-  // ends in) doesn't flush -- which is exactly how the message explaining a crash gets lost.
-  setvbuf(stdout, nullptr, _IONBF, 0);
-  boot_log_main("[main] stdout redirected to sdmc:/gk_stdout.txt\n");
+  // stdout goes to memory, not to the SD card. The card version is what killed the save path:
+  // its writes stop landing after early boot, fmt::print *throws* on a short write, and the save
+  // state machine prints through fmt::print -- see game/switch/stdout_sink.h. The fallback below
+  // is the old behaviour, kept only for the case where the memory stream cannot be created.
+  if (switch_stdout_install_to_memory()) {
+    boot_log_main("[main] stdout -> memory sink (dumped to sdmc:/gk_stdout.txt on demand)\n");
+  } else {
+    freopen("sdmc:/gk_stdout.txt", "w", stdout);
+    // Fully-buffered by default since it's a file now, and abort() (which every failed ASSERT
+    // ends in) doesn't flush -- which is exactly how the message explaining a crash gets lost.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    boot_log_main("[main] stdout -> sdmc:/gk_stdout.txt (memory sink unavailable)\n");
+  }
+
+  // Map libnx's hid shared memory before anything touches hid. This is the fix for the abort the
+  // 10:13 run died on: SDL's touch poll (SWITCH_PumpEvents -> SWITCH_PollTouch) calls
+  // hidGetTouchScreenStates(), and libnx's implementation aborts with Result 0x1159 (2345-0008)
+  // when hidGetSharedmemAddr() comes back NULL -- checked in the disassembly of hidGetTouchScreenStates,
+  // which loads 0x1159 and calls diagAbortWithResult on exactly that condition. The address is NULL
+  // because nothing ever mapped it: SDL calls hidInitializeTouchScreen()/hidInitializeMouse()/
+  // hidInitializeKeyboard(), but none of those create the session or map the buffer -- only
+  // hidInitialize() does, and neither SDL nor this port was calling it (verified: no reference to
+  // hidInitialize in the port's own sources nor in libSDL2.a). libnx documents hidInitialize() as
+  // "called automatically during app startup"; under hbmenu it evidently is not.
+  {
+    const Result hid_rc = hidInitialize();
+    boot_log_main(hid_rc == 0 ? "[main] hidInitialize ok\n"
+                              : "[main] hidInitialize FAILED (rc != 0)\n");
+  }
 #endif
   ArgumentGuard u8_guard(argc, argv);
 #if defined(__SWITCH__)
@@ -341,6 +423,9 @@ int main(int argc, char** argv) {
       auto exit_status = exec_runtime(game_options, arg_ptrs.size(), arg_ptrs.data());
       switch (exit_status) {
         case RuntimeExitStatus::EXIT:
+#if defined(__SWITCH__)
+          switch_stdout_dump_to_card();
+#endif
           return 0;
         case RuntimeExitStatus::RESTART_RUNTIME:
         case RuntimeExitStatus::RUNNING:
@@ -351,8 +436,14 @@ int main(int argc, char** argv) {
       }
     } catch (std::exception& ex) {
       lg::error("Unexpected exception occurred - {}", ex.what());
+#if defined(__SWITCH__)
+      switch_stdout_dump_to_card();
+#endif
       throw ex;
     }
   }
+#if defined(__SWITCH__)
+  switch_stdout_dump_to_card();
+#endif
   return 0;
 }

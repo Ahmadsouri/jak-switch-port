@@ -105,6 +105,10 @@ u8* g_ee_main_mem = nullptr;
 u8* g_ee_main_mem_exec = nullptr;
 #if defined(__SWITCH__)
 static Jit g_ee_jit;
+// The EE memory is created once for the whole process and reused by every later runtime run --
+// main() re-enters exec_runtime() whenever the game asks for a restart (see ee_runner()).
+static bool g_ee_jit_created = false;
+static unsigned int g_runtime_run = 0;
 // Diagnostic-only: lg:: logging isn't visibly routed anywhere reachable from the host while
 // bringing up the Switch port, so boot-order issues get traced via a plain SD card text file
 // instead (same technique switch_jit_test.cpp used successfully). Raw open/write/close rather
@@ -113,7 +117,21 @@ static Jit g_ee_jit;
 #include "game/switch/boot_log.h"
 
 static void boot_log(const char* msg) {
-  switch_boot_log(msg);
+  switch_boot_mark(msg);
+}
+
+// Runtime lifecycle events (start of each run, JIT reuse, shutdown status). These have to
+// survive switch_boot_log_finish(), which latches the per-site boot tracing off: everything
+// interesting about a restart happens long after the game loop has started.
+static void boot_log_event(const char* msg) {
+  switch_boot_log_event(msg);
+}
+#else
+// Same call sites as the Switch build, so the boot tracing below doesn't have to be
+// wrapped in #ifdef pairs at every line.
+[[maybe_unused]] static void boot_log(const char*) {
+}
+[[maybe_unused]] static void boot_log_event(const char*) {
 }
 #endif
 std::thread::id g_main_thread_id = std::thread::id();
@@ -205,22 +223,34 @@ void ee_runner(SystemThreadInterface& iface) {
     // permanently and simultaneously at jitCreate time; jitTransitionTo* then just do cache
     // maintenance (armDCacheFlush/armICacheInvalidate), not permission changes -- confirmed by
     // reading libnx's actual jit.c, not assumed.
-    boot_log("[ee_runner] calling jitCreate\n");
-    Result rc = jitCreate(&g_ee_jit, EE_MAIN_MEM_SIZE);
-    {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "[ee_runner] jitCreate rc=0x%x\n", rc);
-      boot_log(buf);
-    }
-    if (R_FAILED(rc)) {
-      // Without EE main memory nothing downstream can run safely -- the other worker threads
-      // (IOP/deci/ee-worker) are already started by the time we get here and don't check for
-      // this failure before touching g_ee_main_mem, so silently returning here (the pre-existing
-      // behavior, matching the equally-unhandled mmap failure path on desktop below) leaves them
-      // racing to dereference a null pointer instead of surfacing the real error.
-      boot_log("[ee_runner] FATAL: jitCreate failed, aborting\n");
-      iface.initialization_complete();
-      abort();
+    // A runtime restart re-enters this function (main() loops exec_runtime()), and it used to
+    // call jitCreate() a second time here and always fail: svcCreateCodeMemory is a one-shot
+    // per-process resource, so there is no second code region to hand out. The abort() below
+    // then tore the still-fully-live process down through libnx's exit path, whose __appExit()
+    // unmounts sdmc (devoptab_list[3] = NULL) -- which is what killed the console a few frames
+    // later, in whatever thread happened to touch an already-open fd next. Keep the mapping for
+    // the process lifetime and just re-point at it instead; the restart memsets it anyway.
+    if (g_ee_jit_created) {
+      boot_log_event("[ee_runner] restart: reusing the EE memory from the previous run\n");
+    } else {
+      boot_log("[ee_runner] calling jitCreate\n");
+      Result rc = jitCreate(&g_ee_jit, EE_MAIN_MEM_SIZE);
+      {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[ee_runner] jitCreate rc=0x%x\n", rc);
+        boot_log(buf);
+      }
+      if (R_FAILED(rc)) {
+        // Without EE main memory nothing downstream can run safely -- the other worker threads
+        // (IOP/deci/ee-worker) are already started by the time we get here and don't check for
+        // this failure before touching g_ee_main_mem, so silently returning here (the pre-existing
+        // behavior, matching the equally-unhandled mmap failure path on desktop below) leaves them
+        // racing to dereference a null pointer instead of surfacing the real error.
+        boot_log_event("[ee_runner] FATAL: jitCreate failed, aborting\n");
+        iface.initialization_complete();
+        abort();
+      }
+      g_ee_jit_created = true;
     }
     jitTransitionToWritable(&g_ee_jit);
     g_ee_main_mem = (u8*)jitGetRwAddr(&g_ee_jit);
@@ -398,36 +428,51 @@ void iop_runner(SystemThreadInterface& iface, GameVersion version) {
 #if defined(__SWITCH__)
   boot_log("[iop_runner] start\n");
 #endif
+  // The previous build wedged somewhere in the handful of instructions between this
+  // line and the first line of IOP_Kernel's constructor, with no crash report to show
+  // for it. Bracket every step so the next run names the exact call.
+  boot_log("[iop_runner] before prof().root_event\n");
   prof().root_event();
+  boot_log("[iop_runner] after prof().root_event\n");
   prof().begin_event("iop-init");
+  boot_log("[iop_runner] before IOP ctor\n");
   IOP iop;
 #if defined(__SWITCH__)
   boot_log("[iop_runner] IOP constructed\n");
 #endif
   lg::debug("[IOP] Restart!");
   iop.reset_allocator();
+  boot_log("[iop_runner] reset_allocator done\n");
   ee::LIBRARY_sceSif_register(&iop);
+  boot_log("[iop_runner] sceSif_register done\n");
   iop::LIBRARY_register(&iop);
+  boot_log("[iop_runner] iop::LIBRARY_register done\n");
   Gfx::register_vsync_callback([&iop]() { iop.kernel.signal_vblank(); });
+  boot_log("[iop_runner] vsync callback registered\n");
 
   if (version != GameVersion::Jak3 && version != GameVersion::JakX) {
     jak1::dma_init_globals();
     jak2::dma_init_globals();
+    boot_log("[iop_runner] dma_init_globals done\n");
 
     iso_init_globals();
     jak1::iso_init_globals();
     jak2::iso_init_globals();
+    boot_log("[iop_runner] iso_init_globals done\n");
 
     fake_iso_init_globals();
     jak1::fake_iso_init_globals();
     jak2::iso_cd_init_globals();
+    boot_log("[iop_runner] fake_iso_init_globals done\n");
 
     jak1::iso_queue_init_globals();
     jak2::iso_queue_init_globals();
+    boot_log("[iop_runner] iso_queue_init_globals done\n");
 
     jak2::spusstreams_init_globals();
     jak1::ramdisk_init_globals();
     sbank_init_globals();
+    boot_log("[iop_runner] ramdisk/sbank_init_globals done\n");
 
     // soundcommon
     jak1::srpc_init_globals();
@@ -435,13 +480,17 @@ void iop_runner(SystemThreadInterface& iface, GameVersion version) {
     srpc_init_globals();
     ssound_init_globals();
     jak2::ssound_init_globals();
+    boot_log("[iop_runner] srpc/ssound_init_globals done\n");
 
     jak1::stream_init_globals();
     jak2::stream_init_globals();
+    boot_log("[iop_runner] stream_init_globals done\n");
   }
 
   prof().end_event();
+  boot_log("[iop_runner] calling initialization_complete\n");
   iface.initialization_complete();
+  boot_log("[iop_runner] initialization_complete returned\n");
 
   lg::debug("[IOP] Wait for OVERLORD to start...");
   {
@@ -517,6 +566,13 @@ void null_runner(SystemThreadInterface& iface) {
 RuntimeExitStatus exec_runtime(GameLaunchOptions game_options, int argc, const char** argv) {
 #if defined(__SWITCH__)
   boot_log("[exec_runtime] start (main thread)\n");
+  {
+    // Ungated: a restart has to stay visible after boot tracing is switched off.
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[exec_runtime] run #%u starting (previous MasterExit=%d)\n",
+             ++g_runtime_run, (int)MasterExit);
+    boot_log_event(buf);
+  }
 #endif
   prof().root_event();
   g_argc = argc;
@@ -571,18 +627,22 @@ RuntimeExitStatus exec_runtime(GameLaunchOptions game_options, int argc, const c
     auto p = scoped_prof("startup::exec_runtime::iop-start");
     iop_thread.start([=](SystemThreadInterface& sti) { iop_runner(sti, g_game_version); });
   }
+  boot_log("[exec_runtime] iop_thread.start returned\n");
   {
     auto p = scoped_prof("startup::exec_runtime::deci-start");
     deci_thread.start(deci2_runner);
   }
+  boot_log("[exec_runtime] deci_thread.start returned\n");
   {
     auto p = scoped_prof("startup::exec_runtime::ee-worker-start");
     ee_worker_thread.start(ee_worker_runner);
   }
+  boot_log("[exec_runtime] ee_worker_thread.start returned\n");
   {
     auto p = scoped_prof("startup::exec_runtime::ee-start");
     ee_thread.start(ee_runner);
   }
+  boot_log("[exec_runtime] ee_thread.start returned\n");
 
   // step 4: wait for EE to signal a shutdown. meanwhile, run video loop on main thread.
   // TODO relegate this to its own function
@@ -618,7 +678,18 @@ RuntimeExitStatus exec_runtime(GameLaunchOptions game_options, int argc, const c
   }
   lg::info("GOAL Runtime Shutdown (code {})", fmt::underlying(MasterExit));
 #if defined(__SWITCH__)
-  jitClose(&g_ee_jit);
+  {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[exec_runtime] run #%u shutting down, MasterExit=%d\n",
+             g_runtime_run, (int)MasterExit);
+    boot_log_event(buf);
+  }
+  // Only give the code memory back when the process is really leaving. A restart keeps it (see
+  // ee_runner): it cannot be re-created, and the next run memsets it before use.
+  if (MasterExit == RuntimeExitStatus::EXIT) {
+    jitClose(&g_ee_jit);
+    g_ee_jit_created = false;
+  }
 #else
   munmap(g_ee_main_mem, EE_MAIN_MEM_SIZE);
 #endif

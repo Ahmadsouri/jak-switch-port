@@ -14,6 +14,35 @@
 #include "common/util/Assert.h"
 #include "common/util/FileUtil.h"
 #include "common/util/string_util.h"
+#ifdef __SWITCH__
+#include "game/switch/boot_log.h"
+#endif
+
+#ifdef __SWITCH__
+// The log file lives on the SD card, and this logger writes to it from every thread there is --
+// EE, IOP, DECI, the graphics loader, main -- while the graphics loader is concurrently reading
+// game data through the port's direct fsFs* calls. Both paths end up on libnx's one fsp-srv
+// session, and a `Service` there carries no lock: with two requests in flight the kernel rejects
+// one set of IPC buffers with MAKERESULT(Module_Kernel, KernelError_InvalidMemoryState), which is
+// the 0xD401 the card reported. It showed up as a *file open* failing on a file that was plainly
+// present ("cannot be opened (open rc=0xd401, exists=yes)"), which is fatal to the loader.
+//
+// So the logger has to hold the same FS lock the fs-service layer holds, and it must take it
+// before its own mutex so the two never acquire in opposite orders.
+#define LG_SWITCH_FS_GUARD() SwitchFsLock _switch_fs_guard
+// Stop writing files the moment a fatal path has latched switch_process_dying(): abort() is already
+// tearing libnx's devices down, and a log write from another thread at that moment is exactly the
+// Data Abort that has been reported instead of the real failure.
+#define LG_SWITCH_DYING_CHECK()                       \
+  do {                                                \
+    if (switch_process_dying().load(std::memory_order_relaxed)) { \
+      return;                                          \
+    }                                                  \
+  } while (0)
+#else
+#define LG_SWITCH_FS_GUARD() ((void)0)
+#define LG_SWITCH_DYING_CHECK() ((void)0)
+#endif
 
 namespace lg {
 struct Logger {
@@ -30,6 +59,9 @@ struct Logger {
   ~Logger() {
     // will run when program exits.
     if (fp) {
+#ifdef __SWITCH__
+      SwitchFsLock _switch_fs_guard;  // fclose() goes back to the FS service, like every write did
+#endif
       fclose(fp);
     }
   }
@@ -44,6 +76,8 @@ const fmt::color log_colors[] = {
     fmt::color::red,  fmt::color::hot_pink,  fmt::color::hot_pink};
 
 void log_message(level log_level, LogTime& now, const char* message) {
+  LG_SWITCH_DYING_CHECK();  // see LG_SWITCH_DYING_CHECK above: no file I/O while libnx tears down
+  LG_SWITCH_FS_GUARD();  // see LG_SWITCH_FS_GUARD above: this writes to sdmc: from any thread
 #ifdef __linux__
   char date_time_buffer[128];
   time_t now_seconds = now.tv.tv_sec;
@@ -85,6 +119,12 @@ void log_message(level log_level, LogTime& now, const char* message) {
   }
 
   if (log_level == level::die) {
+#ifdef __SWITCH__
+    // Latch before abort(): abort() starts libnx's exit path, which closes service sessions and
+    // unmounts devices under the other threads. Every one of their next file writes would otherwise
+    // dereference a torn-down devoptab entry and be reported as the crash instead of this message.
+    switch_process_dying().store(true, std::memory_order_relaxed);
+#endif
     fflush(stdout);
     fflush(stderr);
     if (gLogger.fp) {
@@ -95,6 +135,8 @@ void log_message(level log_level, LogTime& now, const char* message) {
 }
 
 void log_print(const char* message) {
+  LG_SWITCH_DYING_CHECK();
+  LG_SWITCH_FS_GUARD();
   {
     // We always immediately flush prints because since it has no associated level
     // it could be anything from a fatal error to a useless debug log.
@@ -115,6 +157,8 @@ void log_print(const char* message) {
 }
 
 void log_vprintf(const char* format, va_list arg_list) {
+  LG_SWITCH_DYING_CHECK();
+  LG_SWITCH_FS_GUARD();
   {
     // We always immediately flush prints because since it has no associated level
     // it could be anything from a fatal error to a useless debug log.
@@ -147,6 +191,7 @@ void set_file(const std::string& filename,
               const bool should_rotate,
               const bool append,
               const std::string& dir) {
+  LG_SWITCH_FS_GUARD();  // rotates/removes old logs and opens the new one, all on sdmc:
   ASSERT(!gLogger.fp);
   std::string file_path;
   if (!dir.empty()) {
