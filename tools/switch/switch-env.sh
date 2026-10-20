@@ -1,6 +1,10 @@
 # Environment for building the OpenGOAL Jak 1 Switch port with devkitPro.
 # Source this from a bash shell (Git Bash on Windows). Every path is overridable.
 
+# Prefer a usable devkitPro: the one already exported, else the Windows default, else /opt.
+for _dkp in "${DEVKITPRO:-}" "C:/devkitPro" "/opt/devkitpro"; do
+  if [ -n "$_dkp" ] && [ -d "$_dkp/libnx" ]; then DEVKITPRO="$_dkp"; break; fi
+done
 export DEVKITPRO="${DEVKITPRO:-C:/devkitPro}"
 export DEVKITA64="$DEVKITPRO/devkitA64"
 export PATH="$DEVKITA64/bin:$DEVKITPRO/tools/bin:$PATH"
