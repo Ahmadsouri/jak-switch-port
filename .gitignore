@@ -91,5 +91,12 @@ goalc-report.html
 _new-all-types.gc
 # Switch port build directory (cross-compiled objects, the 195 MB gk ELF, gk.nro)
 /build-switch/
+/out-switch/
+# homebrew artifacts
+*.nro
+*.nacp
+*.nsp
+# portable CMake/Ninja dropped in by tools/switch/switch-env.sh
+/tools/portable/
 # Extracted game assets -- never redistribute; regenerate with the extractor from your own copy
 /iso_data/
