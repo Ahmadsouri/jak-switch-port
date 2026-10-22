@@ -7,6 +7,37 @@ data (`out/jak1`) is built with `--instruction-set arm64`.
 
 Branch base: `06890f31` (kept verbatim in this repo's initial commit) — "Switch port: run Jak 1 as ARM64 homebrew under Horizon/GLES".
 
+## Download and play (no build required)
+
+**[Grab the latest release](https://github.com/Ahmadsouri/jak-switch-port/releases/latest)** —
+`Jak1-Switch-v1.0.0.zip` (46 MB). It contains the port (`gk.nro`), the runtime assets and a
+one-click data tool. It does **not** contain the game: you bring your own ISO.
+
+1. Unpack the zip on a Windows PC somewhere with ~6 GB free (e.g. `C:\Jak1Switch`).
+2. Run `setup\prepare-sd.bat` (or drag your `.iso` onto it). The first run downloads the official
+   OpenGOAL extractor (~43 MB), extracts your ISO and compiles the game data for ARM64.
+3. When it finishes, copy the `switch` folder from the archive to the **root** of your SD card.
+4. Start `switch/jak1/gk.nro` from hbmenu. Hold **R** on an installed title if you get a memory
+   error — that hands the homebrew the full memory pool.
+
+Result on the card:
+
+```
+sdmc:/
+└── switch/jak1/
+    ├── gk.nro
+    └── data/
+        ├── game/               # shaders, fonts, controller db
+        ├── custom_assets/
+        └── out/jak1/           # built from your own disc
+            ├── obj/  iso/  fr3/
+```
+
+Requirements: Atmosphère + hbmenu, ~2 GB free on the SD card, and the **USA (NTSC-U,
+SCUS-97124)** disc — that is the only version the extractor accepts. The build needs no devkitPro
+and no compiler on your machine; [GAME-DATA.md](GAME-DATA.md) explains what the script does and
+how to run the steps by hand.
+
 ## Status
 
 | Item | State |
@@ -59,7 +90,9 @@ fails on draco. Reaching the *source* through a short junction (`C:\jaksrc`) is 
 
 ## Game data
 
-The runtime does not compile GOAL on the console — it loads data built on the host:
+The runtime does not compile GOAL on the console — it loads data built on the host. The release
+tool (`setup\prepare-sd.bat`, source in [`tools/install/`](tools/install/)) does all three steps
+below for you. This is the manual equivalent:
 
 ```bash
 # decompiler outputs the compiler needs (tpage-dir, entities, raw_obj)

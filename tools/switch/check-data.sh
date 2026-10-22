@@ -29,11 +29,16 @@ echo "== checking $DATA"
 [ -f "$DATA/game/assets/sdl_controller_db.txt" ] \
   && ok "game/assets/sdl_controller_db.txt" || printf '  warn  game/assets/sdl_controller_db.txt missing (controller DB)\n'
 
-if [ -d "$DATA/out/jak1/obj" ]; then
-  n=$(ls -1 "$DATA/out/jak1/obj" | wc -l)
-  printf '  info  obj/ files: %s\n' "$n"
-  [ "$n" -ge 900 ] || printf '  warn  far fewer than the ~1039 files a complete jak1 build produces\n'
-fi
+for sub in obj iso fr3; do
+  [ -d "$DATA/out/jak1/$sub" ] || continue
+  n=$(find "$DATA/out/jak1/$sub" -type f | wc -l)
+  printf '  info  %s/ files: %s\n' "$sub" "$n"
+  case "$sub" in
+    obj) [ "$n" -ge 900 ] || printf '  warn  far fewer than the ~1039 files a complete jak1 build produces\n' ;;
+    iso) [ "$n" -ge 300 ] || printf '  warn  far fewer than the ~322 level files a complete build produces\n' ;;
+    fr3) [ "$n" -ge 20 ]  || printf '  warn  level art is missing: the -d extraction step did not run before -c\n' ;;
+  esac
+done
 
 # The data must be ARM64: a stray x86 build loads but the first GOAL call dies.
 probe=$(ls "$DATA"/out/jak1/obj/*.o 2>/dev/null | head -1)
