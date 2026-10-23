@@ -55,6 +55,17 @@ build30 differs from build29 by one change: `pc_read_bank_header()` stages throu
 instead of a stack array (same class of failure as the 64 KB stack buffer fixed in build28 — the FS
 service rejects transfer buffers that live inside the emulated EE memory region).
 
+## Play it — desktop installer
+
+Grab `Jak1-Switch-Installer-<version>.exe` from the [latest
+release](../../releases/latest), run it, and point it at your own disc image. The app runs the three
+data steps described below, assembles the finished `switch/jak1` folder and copies it to the SD
+card. English and Arabic, Windows x64, nothing else to install. Source and build notes:
+[app/README.md](app/README.md).
+
+No game data is included — the installer only runs the official OpenGOAL tools against a copy you
+own.
+
 ## Requirements
 
 - **devkitPro** with: `devkita64-gcc` 16.x, `libnx` 4.x, `switch-sdl2`, `switch-mesa`,
@@ -90,9 +101,10 @@ fails on draco. Reaching the *source* through a short junction (`C:\jaksrc`) is 
 
 ## Game data
 
-The runtime does not compile GOAL on the console — it loads data built on the host. The release
-tool (`setup\prepare-sd.bat`, source in [`tools/install/`](tools/install/)) does all three steps
-below for you. This is the manual equivalent:
+The runtime does not compile GOAL on the console — it loads data built on the host. The desktop
+installer ([`app/`](app/)) and the script `setup\prepare-sd.bat` (source in
+[`tools/install/`](tools/install/)) do all three steps below for you. This is the manual
+equivalent:
 
 ```bash
 # decompiler outputs the compiler needs (tpage-dir, entities, raw_obj)

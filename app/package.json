@@ -1,0 +1,66 @@
+{
+  "name": "jak-switch-installer",
+  "productName": "Jak 1 Switch Installer",
+  "version": "1.1.0",
+  "description": "Desktop installer for the Jak and Daxter: The Precursor Legacy Nintendo Switch port",
+  "main": "main.js",
+  "author": "Ahmad Souri",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/**/*.test.js\"",
+    "ui-check": "node tools/ui-check.js",
+    "resources": "node tools/stage-resources.js",
+    "icon": "electron tools/make-icon.js",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.ahmadsouri.jak1switch",
+    "productName": "Jak 1 Switch Installer",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/proj",
+        "to": "proj"
+      },
+      {
+        "from": "resources/runtime",
+        "to": "runtime"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "Jak 1 Switch Installer",
+      "artifactName": "Jak1-Switch-Installer-${version}.exe"
+    }
+  }
+}

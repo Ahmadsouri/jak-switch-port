@@ -1,5 +1,9 @@
 # Game data — bring your own
 
+The desktop installer ([`app/`](app/)) performs every step on this page for you: pick the ISO, wait,
+and it writes the finished `switch/jak1` folder. The commands below are the manual equivalent, for
+building on Linux/macOS or for understanding what the app is doing.
+
 This project ships **no game data**. Everything the console loads is built on a PC from a copy of
 *Jak and Daxter: The Precursor Legacy* that you own, and it stays on your own SD card.
 

@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+    <title>Jak 1 Switch Installer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <div class="mark" aria-hidden="true">
+            <svg viewBox="0 0 48 48" fill="none">
+              <circle cx="24" cy="24" r="20" stroke="url(#g1)" stroke-width="2.5" />
+              <circle cx="24" cy="24" r="11" stroke="url(#g1)" stroke-width="1.5" opacity=".55" />
+              <path d="M24 10c7 5 7 23 0 28-7-5-7-23 0-28Z" stroke="url(#g2)" stroke-width="2.2" />
+              <defs>
+                <linearGradient id="g1" x1="4" y1="6" x2="44" y2="44">
+                  <stop stop-color="#f5b455" /><stop offset="1" stop-color="#e07b2c" />
+                </linearGradient>
+                <linearGradient id="g2" x1="16" y1="8" x2="32" y2="40">
+                  <stop stop-color="#7ef0c0" /><stop offset="1" stop-color="#2fb98a" />
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1 data-i18n="appTitle">Jak 1 on Nintendo Switch</h1>
+            <p><span data-i18n="appSubtitle">Installer</span> · <span class="muted" data-i18n="tagline"></span></p>
+          </div>
+        </div>
+        <div class="lang" role="group" aria-label="Language">
+          <button type="button" data-lang="en">EN</button>
+          <button type="button" data-lang="ar">ع</button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <aside class="rail">
+          <ol class="steps">
+            <li data-step="1"><span class="dot"></span><span data-i18n="railGame">Your game</span></li>
+            <li data-step="2"><span class="dot"></span><span data-i18n="railPrepare">Prepare</span></li>
+            <li data-step="3"><span class="dot"></span><span data-i18n="railReady">Copy to Switch</span></li>
+          </ol>
+          <div class="rail-foot">
+            <p class="legal" data-i18n="legal"></p>
+            <p class="ver" id="version"></p>
+          </div>
+        </aside>
+
+        <main>
+          <!-- ---------------------------------------------------- choose --- -->
+          <section class="screen is-active" id="screen-choose">
+            <h2 data-i18n="chooseTitle"></h2>
+            <p class="lead" data-i18n="chooseBody"></p>
+
+            <div class="drop" id="drop" tabindex="0" role="button">
+              <svg class="disc" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                <circle cx="32" cy="32" r="26" stroke="currentColor" stroke-width="2" opacity=".8" />
+                <circle cx="32" cy="32" r="7" stroke="currentColor" stroke-width="2" />
+                <path d="M32 6a26 26 0 0 1 22 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+              <strong data-i18n="dropTitle"></strong>
+              <span data-i18n="dropHint"></span>
+            </div>
+
+            <div class="chip" id="fileChip" hidden>
+              <div class="chip-main">
+                <span class="chip-icon">ISO</span>
+                <div>
+                  <b id="fileName"></b>
+                  <small id="fileMeta"></small>
+                </div>
+              </div>
+              <button type="button" class="link" id="changeFile" data-i18n="change"></button>
+            </div>
+
+            <div class="grid2">
+              <div class="field">
+                <label for="outDir" data-i18n="folderTitle"></label>
+                <p class="hint" data-i18n="folderBody"></p>
+                <div class="pathrow">
+                  <input id="outDir" readonly />
+                  <button type="button" class="ghost small" data-pick="outDir" data-i18n="browse"></button>
+                </div>
+                <span class="space" id="outSpace"></span>
+              </div>
+              <div class="field">
+                <label for="workDir" data-i18n="workTitle"></label>
+                <p class="hint" data-i18n="workBody"></p>
+                <div class="pathrow">
+                  <input id="workDir" readonly />
+                  <button type="button" class="ghost small" data-pick="workDir" data-i18n="browse"></button>
+                </div>
+                <span class="space" id="workSpace"></span>
+              </div>
+            </div>
+
+            <label class="toggle">
+              <input type="checkbox" id="reuse" />
+              <span class="track"><span class="knob"></span></span>
+              <span class="toggle-text">
+                <b data-i18n="reuseTitle"></b>
+                <small data-i18n="reuseBody"></small>
+              </span>
+            </label>
+
+            <div class="actions">
+              <button type="button" class="primary" id="startBtn" data-i18n="start"></button>
+              <p class="hint" data-i18n="startHint"></p>
+            </div>
+            <p class="error" id="chooseError" hidden></p>
+          </section>
+
+          <!-- ------------------------------------------------------- run --- -->
+          <section class="screen" id="screen-run">
+            <div class="run-head">
+              <h2 id="runPhase">…</h2>
+              <div class="pct" id="pct">0%</div>
+            </div>
+            <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+            <div class="meta">
+              <span id="eta"></span>
+              <span id="elapsed"></span>
+            </div>
+
+            <ol class="phases" id="phases"></ol>
+
+            <button type="button" class="link" id="logToggle" data-i18n="showLog"></button>
+            <pre class="log" id="log" hidden></pre>
+
+            <div class="actions row">
+              <button type="button" class="danger" id="cancelBtn" data-i18n="cancel"></button>
+            </div>
+          </section>
+
+          <!-- ------------------------------------------------------ done --- -->
+          <section class="screen" id="screen-done">
+            <div class="hero">
+              <div class="check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><path d="m5 13 4 4L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </div>
+              <div>
+                <h2 data-i18n="readyTitle"></h2>
+                <p class="lead" data-i18n="readyBody"></p>
+              </div>
+            </div>
+
+            <div class="stats">
+              <div><b id="statObj">0</b><span data-i18n="statObjects"></span></div>
+              <div><b id="statIso">0</b><span data-i18n="statLevels"></span></div>
+              <div><b id="statFr3">0</b><span data-i18n="statArt"></span></div>
+              <div><b id="statSize">0</b><span data-i18n="statSize"></span></div>
+            </div>
+
+            <div class="field">
+              <label data-i18n="folderLabel"></label>
+              <div class="pathrow">
+                <input id="installPath" readonly />
+                <button type="button" class="ghost small" id="openFolder" data-i18n="openFolder"></button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h3 data-i18n="copyTitle"></h3>
+                <div class="row-inline">
+                  <select id="driveSelect"></select>
+                  <button type="button" class="ghost small" id="pickTarget" data-i18n="chooseFolder"></button>
+                  <button type="button" class="ghost small" id="refreshDrives" data-i18n="refresh"></button>
+                </div>
+              </div>
+              <p class="hint" data-i18n="copyBody"></p>
+              <button type="button" class="primary" id="copyBtn" data-i18n="copy"></button>
+              <div class="bar thin" id="copyBarWrap" hidden><div class="bar-fill" id="copyBar"></div></div>
+              <p class="status" id="copyStatus"></p>
+            </div>
+
+            <div class="card guide">
+              <h3 data-i18n="guideTitle"></h3>
+              <ol>
+                <li data-i18n="guide1"></li>
+                <li data-i18n="guide2"></li>
+                <li data-i18n="guide3"></li>
+                <li data-i18n="guide4"></li>
+                <li data-i18n="guide5"></li>
+              </ol>
+            </div>
+
+            <div class="actions">
+              <button type="button" class="ghost" id="againBtn" data-i18n="startOver"></button>
+            </div>
+          </section>
+
+          <!-- ----------------------------------------------------- error --- -->
+          <section class="screen" id="screen-error">
+            <div class="hero error">
+              <div class="check" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none"><path d="M12 8v5m0 3.5v.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
+              </div>
+              <div>
+                <h2 data-i18n="errTitle"></h2>
+                <p class="lead" id="errMessage"></p>
+              </div>
+            </div>
+            <div class="actions row">
+              <button type="button" class="primary" id="retryBtn" data-i18n="retry"></button>
+              <button type="button" class="ghost" id="errorLog" data-i18n="openLog"></button>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>
